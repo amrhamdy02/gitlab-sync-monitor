@@ -765,7 +765,7 @@ app.get('/api/audit/commits', (req, res) => {
   }
 });
 
-// Webhook endpoint (Phase 2 - for future approval workflow)
+// Webhook endpoint - Process GitLab push events for real-time monitoring
 app.post('/api/webhook', (req, res) => {
   const signature = req.headers['x-gitlab-token'];
   
@@ -777,8 +777,79 @@ app.post('/api/webhook', (req, res) => {
   const event = req.headers['x-gitlab-event'];
   console.log(`📨 Received webhook: ${event}`);
   
-  // Phase 2: Handle webhook for approval workflow
-  // For now, just log it
+  // Handle Push events for commit monitoring
+  if (event === 'Push Hook') {
+    try {
+      const payload = req.body;
+      const projectName = payload.project?.name || 'Unknown';
+      const projectId = payload.project?.id;
+      const ref = payload.ref || '';
+      const branch = ref.replace('refs/heads/', '');
+      const isForce = payload.total_commits_count === 0 && payload.commits?.length === 0;
+      
+      console.log(`  📝 Push to ${projectName}/${branch} (${payload.commits?.length || 0} commits)`);
+      
+      // Find repository in database
+      let repoId = null;
+      if (projectId) {
+        const repo = db.prepare('SELECT id FROM repositories WHERE gitlab_id = ?').get(projectId);
+        repoId = repo?.id;
+      }
+      
+      // Log commits to audit
+      if (payload.commits && payload.commits.length > 0) {
+        const commitData = payload.commits.map(commit => ({
+          branch: branch,
+          sha: commit.id,
+          message: commit.message,
+          author_name: commit.author?.name || 'Unknown',
+          author_email: commit.author?.email || '',
+          timestamp: commit.timestamp,
+          type: commit.message?.toLowerCase().includes('merge') ? 'merge' : 'push',
+          is_force: isForce
+        }));
+        
+        logCommitsToAudit(repoId, projectName, commitData);
+        console.log(`  ✅ Logged ${commitData.length} commits to audit`);
+        
+        // Emit to connected clients for real-time update
+        emitToClients('audit_updated', {
+          repository: projectName,
+          branch: branch,
+          commits: commitData.length,
+          isForce: isForce
+        });
+      } else if (isForce) {
+        // Force push with no commits shown (rewrites history)
+        console.log(`  ⚠️ Force push detected on ${branch}`);
+        
+        const forcePushData = [{
+          branch: branch,
+          sha: payload.after || 'unknown',
+          message: `Force push to ${branch}`,
+          author_name: payload.user_name || 'Unknown',
+          author_email: payload.user_email || '',
+          timestamp: new Date().toISOString(),
+          type: 'force',
+          is_force: true
+        }];
+        
+        logCommitsToAudit(repoId, projectName, forcePushData);
+        
+        emitToClients('audit_updated', {
+          repository: projectName,
+          branch: branch,
+          commits: 1,
+          isForce: true
+        });
+      }
+      
+    } catch (error) {
+      console.error('❌ Error processing webhook:', error);
+    }
+  }
+  
+  // Legacy webhook event notification
   emitToClients('webhook_received', {
     event,
     timestamp: new Date().toISOString()
