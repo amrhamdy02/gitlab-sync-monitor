@@ -134,11 +134,31 @@ function initializeDatabase() {
       FOREIGN KEY (repository_id) REFERENCES repositories(id)
     );
     
+    -- Commit audit log table
+    CREATE TABLE IF NOT EXISTS commit_audit (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repository_id INTEGER,
+      repository_name TEXT,
+      branch TEXT,
+      commit_sha TEXT,
+      commit_message TEXT,
+      author_name TEXT,
+      author_email TEXT,
+      commit_type TEXT CHECK(commit_type IN ('push', 'merge', 'force')),
+      is_force_push BOOLEAN DEFAULT 0,
+      timestamp DATETIME,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (repository_id) REFERENCES repositories(id)
+    );
+    
     -- Create indexes
     CREATE INDEX IF NOT EXISTS idx_sync_history_repo ON sync_history(repository_id);
     CREATE INDEX IF NOT EXISTS idx_sync_history_status ON sync_history(status);
     CREATE INDEX IF NOT EXISTS idx_pending_approvals_status ON pending_approvals(status);
     CREATE INDEX IF NOT EXISTS idx_repositories_gitlab_id ON repositories(gitlab_id);
+    CREATE INDEX IF NOT EXISTS idx_commit_audit_repo ON commit_audit(repository_id);
+    CREATE INDEX IF NOT EXISTS idx_commit_audit_branch ON commit_audit(branch);
+    CREATE INDEX IF NOT EXISTS idx_commit_audit_timestamp ON commit_audit(timestamp DESC);
   `);
   
   console.log('✅ Database initialized successfully');
@@ -327,6 +347,34 @@ function getSyncHistory(limit = 50) {
   return stmt.all(limit);
 }
 
+function logCommitsToAudit(repositoryId, repositoryName, commits) {
+  const stmt = db.prepare(`
+    INSERT INTO commit_audit (
+      repository_id, repository_name, branch, commit_sha, commit_message,
+      author_name, author_email, commit_type, is_force_push, timestamp
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  
+  for (const commit of commits) {
+    try {
+      stmt.run(
+        repositoryId,
+        repositoryName,
+        commit.branch || 'unknown',
+        commit.sha,
+        commit.message,
+        commit.author_name,
+        commit.author_email,
+        commit.type || 'push',
+        commit.is_force ? 1 : 0,
+        commit.timestamp || new Date().toISOString()
+      );
+    } catch (error) {
+      console.warn(`Failed to log commit ${commit.sha}:`, error.message);
+    }
+  }
+}
+
 // ============================================================================
 // SYNC OPERATIONS
 // ============================================================================
@@ -481,6 +529,42 @@ async function syncRepository(repoId) {
     
     // Push with mirror
     await repoGit.push(targetUrl.toString(), '--mirror');
+    
+    // Extract and log commits for audit
+    try {
+      const branches = await repoGit.branch(['-r']);
+      const commitData = [];
+      
+      for (const branchName of Object.keys(branches.branches)) {
+        const cleanBranch = branchName.replace('origin/', '');
+        try {
+          const log = await repoGit.log({ [cleanBranch]: null, maxCount: 10 });
+          
+          for (const commit of log.all) {
+            commitData.push({
+              branch: cleanBranch,
+              sha: commit.hash,
+              message: commit.message,
+              author_name: commit.author_name,
+              author_email: commit.author_email,
+              timestamp: commit.date,
+              type: commit.message.toLowerCase().includes('merge') ? 'merge' : 'push',
+              is_force: false
+            });
+          }
+        } catch (branchError) {
+          // Branch might be empty or invalid, skip it
+          console.warn(`  ⚠️ Could not get log for branch ${cleanBranch}`);
+        }
+      }
+      
+      if (commitData.length > 0) {
+        logCommitsToAudit(repoId, repo.name, commitData);
+        console.log(`  📝 Logged ${commitData.length} commits to audit`);
+      }
+    } catch (auditError) {
+      console.warn(`  ⚠️ Could not log commits to audit: ${auditError.message}`);
+    }
     
     // Re-protect branches that were protected
     if (protectedBranches.length > 0) {
@@ -650,6 +734,33 @@ app.get('/api/sync/history', (req, res) => {
     res.json(history);
   } catch (error) {
     console.error('Error fetching sync history:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get commit audit log
+app.get('/api/audit/commits', (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 100;
+    const stmt = db.prepare(`
+      SELECT 
+        repository_name as repository,
+        branch,
+        commit_sha as sha,
+        commit_message as message,
+        author_name,
+        author_email,
+        commit_type as type,
+        is_force_push as is_force,
+        timestamp
+      FROM commit_audit
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `);
+    const commits = stmt.all(limit);
+    res.json(commits);
+  } catch (error) {
+    console.error('Error fetching commit audit:', error);
     res.status(500).json({ error: error.message });
   }
 });
