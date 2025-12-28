@@ -397,9 +397,6 @@ async function syncRepository(repoId) {
     
     const git = simpleGit();
     
-    // Configure git to trust self-signed certificates (for corporate environments)
-    await git.addConfig('http.sslVerify', 'false', false, 'global');
-    
     // Clone or update local repository
     if (!fs.existsSync(localPath)) {
       console.log(`  📥 Cloning ${repo.name}...`);
@@ -716,10 +713,9 @@ function startScheduledSync() {
 // ============================================================================
 async function startServer() {
   try {
-    // Configure Git globally to trust self-signed certificates (for corporate environments)
-    const git = simpleGit();
-    await git.addConfig('http.sslVerify', 'false', false, 'global');
-    console.log('🔧 Git configured to trust self-signed certificates');
+    // Git SSL configuration is handled via GIT_SSL_NO_VERIFY environment variable
+    // Set in Dockerfile, no need to write config file
+    console.log('🔧 Git configured to trust self-signed certificates (via GIT_SSL_NO_VERIFY)');
     
     // Initialize GitLab clients
     const gitlabReady = initializeGitlabClients();
