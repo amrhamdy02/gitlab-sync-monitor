@@ -1,60 +1,89 @@
-# Node modules
-node_modules
+# Dependencies
+node_modules/
+/.pnp
+.pnp.js
+
+# Testing
+/coverage
+
+# Production
+/build
+/dist
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Logs
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+lerna-debug.log*
+*.log
 
-# Environment files
-.env
-.env.local
-.env.*.local
-
-# Test files
-**/*.test.js
-**/*.spec.js
-test/
-tests/
-__tests__/
-coverage/
-
-# Development files
-.git
-.gitignore
-.vscode/
-.idea/
-*.md
-!README.md
-
-# Documentation
-docs/
-*.md
-!README.md
-
-# Deployment files (not needed in image)
-deployment/
-openshift/
-kubernetes/
-
-# Data directories (will be mounted)
+# Data directories
 data/
+repos/
 *.db
-*.db-*
+*.db-shm
+*.db-wal
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# Build artifacts
+*.tgz
+*.zip
+*.tar.gz
 
 # Temporary files
 tmp/
 temp/
-*.tmp
-*.log
+.cache/
 
-# Archives
-*.tar
-*.tar.gz
-*.zip
+# Debug
+.pids
+*.pid
+*.seed
+*.pid.lock
 
-# OS files
-.DS_Store
-Thumbs.db
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
 
-# Backups
-*.backup
-*.bak
+# Coverage
+lib-cov
+coverage
+.nyc_output
+
+# Certificates (never commit these!)
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Secrets (never commit these!)
+secrets/
+*.secret
+*.token
