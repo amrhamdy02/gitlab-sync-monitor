@@ -13,8 +13,8 @@ WORKDIR /app/frontend
 # Copy frontend package files
 COPY frontend/package*.json ./
 
-# Install dependencies
-RUN npm ci --omit=dev
+# Install dependencies (using npm install for flexibility)
+RUN npm install --production
 
 # Copy frontend source
 COPY frontend/ ./
@@ -35,8 +35,8 @@ RUN apk add --no-cache python3 make g++ git
 # Copy backend package files
 COPY backend/package*.json ./
 
-# Install dependencies (including better-sqlite3 7.6.2)
-RUN npm ci --omit=dev
+# Install dependencies (using npm install for flexibility)
+RUN npm install --production
 
 # ============================================================================
 # Stage 3: Production Image
