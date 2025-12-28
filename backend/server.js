@@ -39,8 +39,8 @@ const CONFIG = {
   syncSchedule: process.env.SYNC_SCHEDULE || '0 2 * * *', // 2 AM daily
   
   // File Paths
-  dbPath: process.env.DB_PATH || './data/sync.db',
-  reposPath: process.env.REPOS_PATH || './data/repos'
+  dbPath: process.env.DB_PATH || '/data/sync.db',
+  reposPath: process.env.REPOS_PATH || '/data/repos'
 };
 
 // ============================================================================
