@@ -101,6 +101,7 @@ function initializeDatabase() {
       ssh_url TEXT,
       http_url TEXT,
       last_activity DATETIME,
+      has_new_commits BOOLEAN DEFAULT 0,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
@@ -226,16 +227,20 @@ function sanitizeRepoName(name) {
 }
 
 // Verify webhook signature
-function verifyWebhookSignature(payload, signature) {
-  if (!CONFIG.webhookSecret) return false;
+function verifyWebhookSignature(payload, receivedToken) {
+  if (!CONFIG.webhookSecret) {
+    console.warn('⚠️ No webhook secret configured, skipping verification');
+    return true; // Allow if no secret configured
+  }
   
-  const hmac = crypto.createHmac('sha256', CONFIG.webhookSecret);
-  const digest = hmac.update(JSON.stringify(payload)).digest('hex');
+  if (!receivedToken) {
+    console.warn('⚠️ No token received in webhook');
+    return false;
+  }
   
-  return crypto.timingSafeEqual(
-    Buffer.from(signature),
-    Buffer.from(digest)
-  );
+  // GitLab sends the secret token directly in X-Gitlab-Token header
+  // Simple comparison (GitLab doesn't use HMAC by default)
+  return receivedToken === CONFIG.webhookSecret;
 }
 
 // Emit event to all connected clients
@@ -253,7 +258,8 @@ function getRepositories() {
     SELECT r.*, 
            sh.status as last_sync_status,
            sh.completed_at as last_sync_time,
-           sh.error_message as last_sync_error
+           sh.error_message as last_sync_error,
+           r.has_new_commits
     FROM repositories r
     LEFT JOIN (
       SELECT repository_id, status, completed_at, error_message,
@@ -588,6 +594,9 @@ async function syncRepository(repoId) {
     
     updateSyncHistory(syncId, 'success', null, commitCount);
     
+    // Clear the "new commits" flag since we just synced
+    db.prepare('UPDATE repositories SET has_new_commits = 0 WHERE id = ?').run(repoId);
+    
     console.log(`✅ Successfully synced ${repo.name} (${commitCount} commits)`);
     
     emitToClients('sync_completed', {
@@ -794,6 +803,17 @@ app.post('/api/webhook', (req, res) => {
       if (projectId) {
         const repo = db.prepare('SELECT id FROM repositories WHERE gitlab_id = ?').get(projectId);
         repoId = repo?.id;
+        
+        // Mark repository as having new commits (needs sync)
+        if (repoId) {
+          db.prepare('UPDATE repositories SET has_new_commits = 1 WHERE id = ?').run(repoId);
+          
+          // Notify UI to refresh repository list
+          emitToClients('repositories_updated', {
+            repositoryId: repoId,
+            hasNewCommits: true
+          });
+        }
       }
       
       // Log commits to audit

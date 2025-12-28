@@ -385,7 +385,11 @@ function App() {
             <div key={repo.id} className="repo-card">
               <div className="repo-header">
                 <h3 className="repo-name">{repo.name}</h3>
-                {repo.last_sync_status && getStatusBadge(repo.last_sync_status)}
+                {repo.has_new_commits ? (
+                  getStatusBadge('pending')
+                ) : repo.last_sync_status ? (
+                  getStatusBadge(repo.last_sync_status)
+                ) : null}
               </div>
               
               <p className="repo-path">{repo.path}</p>
