@@ -1,163 +1,717 @@
-.app {
+/* ============================================================================
+   GLOBAL STYLES
+   ============================================================================ */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  min-height: 100vh;
+}
+
+code {
+  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
+    monospace;
+  background: #f4f4f4;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 0.9em;
+}
+
+/* ============================================================================
+   APP LAYOUT
+   ============================================================================ */
+.App {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
 }
 
-.app-content {
+.app-header {
+  background: rgba(255, 255, 255, 0.95);
+  backdrop-filter: blur(10px);
+  padding: 1.5rem 2rem;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+
+.app-header h1 {
+  font-size: 1.8rem;
+  color: #2d3748;
+  font-weight: 700;
+}
+
+.header-info {
+  display: flex;
+  gap: 1.5rem;
+  align-items: center;
+}
+
+.connection-status {
+  padding: 0.5rem 1rem;
+  border-radius: 20px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  transition: all 0.3s ease;
+}
+
+.connection-status.connected {
+  background: #d4edda;
+  color: #155724;
+}
+
+.connection-status.disconnected,
+.connection-status.connecting {
+  background: #f8d7da;
+  color: #721c24;
+}
+
+.repo-count {
+  background: #667eea;
+  color: white;
+  padding: 0.5rem 1rem;
+  border-radius: 20px;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+/* ============================================================================
+   NAVIGATION
+   ============================================================================ */
+.app-nav {
+  background: rgba(255, 255, 255, 0.9);
+  backdrop-filter: blur(10px);
+  padding: 1rem 2rem;
+  display: flex;
+  gap: 1rem;
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.05);
+}
+
+.nav-button {
+  background: transparent;
+  border: none;
+  padding: 0.75rem 1.5rem;
+  font-size: 1rem;
+  font-weight: 600;
+  color: #4a5568;
+  cursor: pointer;
+  border-radius: 8px;
+  transition: all 0.3s ease;
+  position: relative;
+}
+
+.nav-button:hover {
+  background: rgba(102, 126, 234, 0.1);
+  color: #667eea;
+}
+
+.nav-button.active {
+  background: #667eea;
+  color: white;
+}
+
+.nav-button.active::after {
+  content: '';
+  position: absolute;
+  bottom: -1rem;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 0;
+  height: 0;
+  border-left: 8px solid transparent;
+  border-right: 8px solid transparent;
+  border-top: 8px solid #667eea;
+}
+
+/* ============================================================================
+   MAIN CONTENT
+   ============================================================================ */
+.app-main {
   flex: 1;
-  padding: 20px;
+  padding: 2rem;
   max-width: 1400px;
   margin: 0 auto;
   width: 100%;
 }
 
-.spinner {
-  border: 4px solid #f3f3f3;
-  border-top: 4px solid #3498db;
-  border-radius: 50%;
-  width: 40px;
-  height: 40px;
-  animation: spin 1s linear infinite;
+.section-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 2rem;
+  flex-wrap: wrap;
+  gap: 1rem;
 }
 
-@keyframes spin {
-  0% { transform: rotate(0deg); }
-  100% { transform: rotate(360deg); }
+.section-header h2 {
+  font-size: 1.8rem;
+  color: white;
+  font-weight: 700;
 }
 
-/* Utility Classes */
+.header-actions {
+  display: flex;
+  gap: 1rem;
+}
+
+/* ============================================================================
+   BUTTONS
+   ============================================================================ */
 .btn {
-  padding: 10px 20px;
+  padding: 0.75rem 1.5rem;
   border: none;
-  border-radius: 4px;
+  border-radius: 8px;
+  font-size: 1rem;
+  font-weight: 600;
   cursor: pointer;
-  font-size: 14px;
-  font-weight: 500;
-  transition: all 0.2s;
+  transition: all 0.3s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
 }
 
 .btn:disabled {
-  opacity: 0.5;
+  opacity: 0.6;
   cursor: not-allowed;
 }
 
 .btn-primary {
-  background-color: #3498db;
+  background: #667eea;
   color: white;
 }
 
 .btn-primary:hover:not(:disabled) {
-  background-color: #2980b9;
-}
-
-.btn-success {
-  background-color: #2ecc71;
-  color: white;
-}
-
-.btn-success:hover:not(:disabled) {
-  background-color: #27ae60;
-}
-
-.btn-danger {
-  background-color: #e74c3c;
-  color: white;
-}
-
-.btn-danger:hover:not(:disabled) {
-  background-color: #c0392b;
+  background: #5568d3;
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
 }
 
 .btn-secondary {
-  background-color: #95a5a6;
-  color: white;
+  background: white;
+  color: #667eea;
+  border: 2px solid #667eea;
 }
 
 .btn-secondary:hover:not(:disabled) {
-  background-color: #7f8c8d;
+  background: #667eea;
+  color: white;
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
 }
 
-.card {
-  background: white;
+.btn-link {
+  background: transparent;
+  color: #667eea;
+  padding: 0.5rem 1rem;
+  text-decoration: none;
+}
+
+.btn-link:hover {
+  background: rgba(102, 126, 234, 0.1);
+}
+
+/* ============================================================================
+   NOTIFICATIONS
+   ============================================================================ */
+.notification {
+  position: fixed;
+  top: 5rem;
+  right: 2rem;
+  padding: 1rem 1.5rem;
   border-radius: 8px;
-  padding: 20px;
-  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-  margin-bottom: 20px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  z-index: 1000;
+  animation: slideIn 0.3s ease;
+  max-width: 400px;
 }
 
-.badge {
-  display: inline-block;
-  padding: 4px 8px;
+@keyframes slideIn {
+  from {
+    transform: translateX(400px);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+.notification-info {
+  background: #cfe2ff;
+  color: #084298;
+  border-left: 4px solid #0d6efd;
+}
+
+.notification-success {
+  background: #d4edda;
+  color: #155724;
+  border-left: 4px solid #28a745;
+}
+
+.notification-warning {
+  background: #fff3cd;
+  color: #856404;
+  border-left: 4px solid #ffc107;
+}
+
+.notification-error {
+  background: #f8d7da;
+  color: #721c24;
+  border-left: 4px solid #dc3545;
+}
+
+.notification-close {
+  background: transparent;
+  border: none;
+  font-size: 1.5rem;
+  cursor: pointer;
+  color: inherit;
+  opacity: 0.7;
+  transition: opacity 0.3s;
+}
+
+.notification-close:hover {
+  opacity: 1;
+}
+
+/* ============================================================================
+   REPOSITORIES GRID
+   ============================================================================ */
+.repositories-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+  gap: 1.5rem;
+}
+
+.repo-card {
+  background: white;
+  border-radius: 12px;
+  padding: 1.5rem;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+  transition: all 0.3s ease;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.repo-card:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 8px 16px rgba(0, 0, 0, 0.15);
+}
+
+.repo-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.repo-name {
+  font-size: 1.2rem;
+  color: #2d3748;
+  font-weight: 700;
+  flex: 1;
+  word-break: break-word;
+}
+
+.repo-path {
+  color: #718096;
+  font-size: 0.9rem;
+  font-family: 'Courier New', monospace;
+}
+
+.repo-description {
+  color: #4a5568;
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
+.repo-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid #e2e8f0;
+}
+
+.meta-item {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.85rem;
+}
+
+.meta-label {
+  color: #718096;
+  font-weight: 600;
+}
+
+.meta-value {
+  color: #4a5568;
+}
+
+.repo-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: space-between;
+  margin-top: auto;
+}
+
+.error-message {
+  background: #fff5f5;
+  border-left: 3px solid #fc8181;
+  padding: 0.5rem;
+  font-size: 0.85rem;
+  color: #c53030;
   border-radius: 4px;
-  font-size: 12px;
+}
+
+/* ============================================================================
+   STATUS BADGES
+   ============================================================================ */
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.4rem 0.8rem;
+  border-radius: 20px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.status-icon {
+  font-size: 1rem;
+}
+
+.status-success {
+  background: #d4edda;
+  color: #155724;
+}
+
+.status-failed {
+  background: #f8d7da;
+  color: #721c24;
+}
+
+.status-running {
+  background: #cfe2ff;
+  color: #084298;
+  animation: pulse 2s infinite;
+}
+
+.status-pending {
+  background: #fff3cd;
+  color: #856404;
+}
+
+.status-unknown {
+  background: #e2e8f0;
+  color: #4a5568;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+/* ============================================================================
+   SYNC HISTORY TABLE
+   ============================================================================ */
+.history-table-container {
+  background: white;
+  border-radius: 12px;
+  padding: 1.5rem;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+  overflow-x: auto;
+}
+
+.history-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.history-table thead {
+  background: #f7fafc;
+}
+
+.history-table th {
+  padding: 1rem;
+  text-align: left;
+  font-weight: 700;
+  color: #2d3748;
+  border-bottom: 2px solid #e2e8f0;
+  white-space: nowrap;
+}
+
+.history-table td {
+  padding: 1rem;
+  border-bottom: 1px solid #e2e8f0;
+  color: #4a5568;
+}
+
+.history-table tbody tr:hover {
+  background: #f7fafc;
+}
+
+.repo-name-cell {
+  font-weight: 600;
+  color: #2d3748;
+}
+
+.commits-cell {
+  text-align: center;
+  font-weight: 600;
+  color: #667eea;
+}
+
+.error-cell {
+  text-align: center;
+}
+
+.error-tooltip {
+  cursor: help;
+  font-size: 1.2rem;
+  color: #fc8181;
+}
+
+/* ============================================================================
+   CONFIGURATION SECTION
+   ============================================================================ */
+.config-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 1.5rem;
+  margin-bottom: 2rem;
+}
+
+.config-card {
+  background: white;
+  border-radius: 12px;
+  padding: 1.5rem;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+.config-card h3 {
+  color: #2d3748;
+  font-size: 1.2rem;
+  margin-bottom: 1rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 2px solid #667eea;
+}
+
+.config-details {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.config-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.config-label {
+  color: #718096;
+  font-size: 0.85rem;
   font-weight: 600;
   text-transform: uppercase;
+  letter-spacing: 0.5px;
 }
 
-.badge-pending {
-  background-color: #f39c12;
+.config-value {
+  color: #2d3748;
+  font-size: 1rem;
+  font-weight: 500;
+  word-break: break-all;
+}
+
+.env-instructions {
+  background: white;
+  border-radius: 12px;
+  padding: 1.5rem;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+.env-instructions h3 {
+  color: #2d3748;
+  font-size: 1.2rem;
+  margin-bottom: 1rem;
+}
+
+.env-instructions p {
+  color: #4a5568;
+  margin-bottom: 1rem;
+  line-height: 1.6;
+}
+
+.env-instructions ul {
+  list-style: none;
+  padding: 0;
+}
+
+.env-instructions li {
+  padding: 0.5rem 0;
+  color: #4a5568;
+  line-height: 1.6;
+}
+
+/* ============================================================================
+   LOADING & EMPTY STATES
+   ============================================================================ */
+.loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 4rem 2rem;
   color: white;
 }
 
-.badge-approved {
-  background-color: #3498db;
-  color: white;
+.spinner {
+  width: 50px;
+  height: 50px;
+  border: 4px solid rgba(255, 255, 255, 0.3);
+  border-top-color: white;
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+  margin-bottom: 1rem;
 }
 
-.badge-mirrored {
-  background-color: #2ecc71;
-  color: white;
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
-.badge-failed {
-  background-color: #e74c3c;
-  color: white;
-}
-
-.badge-declined {
-  background-color: #95a5a6;
-  color: white;
-}
-
-.alert {
-  padding: 15px;
-  border-radius: 4px;
-  margin-bottom: 20px;
-}
-
-.alert-success {
-  background-color: #d4edda;
-  color: #155724;
-  border: 1px solid #c3e6cb;
-}
-
-.alert-error {
-  background-color: #f8d7da;
-  color: #721c24;
-  border: 1px solid #f5c6cb;
-}
-
-.alert-info {
-  background-color: #d1ecf1;
-  color: #0c5460;
-  border: 1px solid #bee5eb;
+.loading p {
+  font-size: 1.1rem;
+  font-weight: 600;
 }
 
 .empty-state {
+  background: white;
+  border-radius: 12px;
+  padding: 4rem 2rem;
   text-align: center;
-  padding: 60px 20px;
-  color: #7f8c8d;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
 }
 
-.empty-state h3 {
-  margin-bottom: 10px;
-  color: #95a5a6;
+.empty-state p {
+  color: #718096;
+  font-size: 1.2rem;
+  margin-bottom: 1.5rem;
 }
 
-.loading {
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  padding: 40px;
+/* ============================================================================
+   FOOTER
+   ============================================================================ */
+.app-footer {
+  background: rgba(255, 255, 255, 0.9);
+  backdrop-filter: blur(10px);
+  padding: 1.5rem;
+  text-align: center;
+  color: #718096;
+  font-size: 0.9rem;
+  box-shadow: 0 -2px 10px rgba(0, 0, 0, 0.05);
+}
+
+/* ============================================================================
+   RESPONSIVE DESIGN
+   ============================================================================ */
+@media (max-width: 768px) {
+  .app-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .header-info {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .app-nav {
+    flex-direction: column;
+    padding: 0.5rem;
+  }
+
+  .nav-button.active::after {
+    display: none;
+  }
+
+  .repositories-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .section-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .header-actions {
+    width: 100%;
+    flex-direction: column;
+  }
+
+  .header-actions .btn {
+    width: 100%;
+  }
+
+  .repo-actions {
+    flex-direction: column;
+  }
+
+  .repo-actions .btn {
+    width: 100%;
+  }
+
+  .notification {
+    right: 1rem;
+    left: 1rem;
+    max-width: none;
+  }
+
+  .history-table-container {
+    padding: 1rem;
+  }
+
+  .history-table {
+    font-size: 0.85rem;
+  }
+
+  .history-table th,
+  .history-table td {
+    padding: 0.5rem;
+  }
+}
+
+@media (max-width: 480px) {
+  .app-header h1 {
+    font-size: 1.4rem;
+  }
+
+  .section-header h2 {
+    font-size: 1.4rem;
+  }
+
+  .repo-card {
+    padding: 1rem;
+  }
+
+  .config-grid {
+    grid-template-columns: 1fr;
+  }
 }

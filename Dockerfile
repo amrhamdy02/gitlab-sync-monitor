@@ -1,46 +1,90 @@
-FROM registry.access.redhat.com/ubi9/nodejs-18:latest
+# ============================================================================
+# Multi-stage Dockerfile for GitLab Sync Monitor
+# Security Hardened - Phase 1
+# ============================================================================
 
-USER 0
+# ============================================================================
+# Stage 1: Build Frontend
+# ============================================================================
+FROM node:18-alpine AS frontend-builder
 
-# Install build tools needed for better-sqlite3
-RUN yum install -y python3 make gcc gcc-c++ && \
-    yum clean all
+WORKDIR /app/frontend
 
-# Create app directory
-WORKDIR /app/monitor
+# Copy frontend package files
+COPY frontend/package*.json ./
 
-# Copy package files first (for better caching)
+# Install dependencies
+RUN npm ci --only=production
+
+# Copy frontend source
+COPY frontend/ ./
+
+# Build frontend
+RUN npm run build
+
+# ============================================================================
+# Stage 2: Build Backend
+# ============================================================================
+FROM node:18-alpine AS backend-builder
+
+WORKDIR /app/backend
+
+# Install build dependencies for better-sqlite3
+RUN apk add --no-cache python3 make g++ git
+
+# Copy backend package files
 COPY backend/package*.json ./
 
-# Configure npm 
-RUN npm config set registry http://registry.npmjs.org/ && \
-    npm config set strict-ssl false
+# Install dependencies (including better-sqlite3 7.6.2)
+RUN npm ci --only=production
 
-# Install dependencies with specific better-sqlite3 version
-RUN npm install better-sqlite3@7.6.2 --build-from-source && \
-    npm install --only=production && \
-    npm cache clean --force
+# ============================================================================
+# Stage 3: Production Image
+# ============================================================================
+FROM node:18-alpine
 
-# Copy application code
-COPY backend/ ./
+# Install runtime dependencies
+RUN apk add --no-cache \
+    git \
+    openssh-client \
+    ca-certificates \
+    tini
 
-# Create data directory for SQLite database
-RUN mkdir -p /app/monitor/data
+# Create app user (security best practice - don't run as root)
+RUN addgroup -g 1001 -S appuser && \
+    adduser -u 1001 -S appuser -G appuser
 
-# Create non-root user
-RUN useradd -r -u 1002 -g 0 nodejs && \
-    chown -R 1001:0 /app && \
-    chmod -R g=u /app
+# Set working directory
+WORKDIR /app
+
+# Copy backend from builder
+COPY --from=backend-builder /app/backend ./backend
+
+# Copy frontend build from builder
+COPY --from=frontend-builder /app/frontend/build ./frontend/build
+
+# Copy backend source code
+COPY backend/server.js ./backend/
+
+# Create required directories with proper permissions
+RUN mkdir -p /data/repos && \
+    chown -R appuser:appuser /app /data
 
 # Switch to non-root user
-USER 1002
+USER appuser
 
 # Expose port
-EXPOSE 3000
+EXPOSE 3001
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD node -e "require('http').get('http://localhost:3000/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
+    CMD node -e "require('http').get('http://localhost:3001/api/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
 
-# Start the application
+# Set working directory to backend
+WORKDIR /app/backend
+
+# Use tini as init system (handles signals properly)
+ENTRYPOINT ["/sbin/tini", "--"]
+
+# Start application
 CMD ["node", "server.js"]

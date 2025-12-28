@@ -1,15 +1,14 @@
 {
   "name": "gitlab-sync-monitor-frontend",
-  "version": "2.0.0",
-  "description": "GitLab Sync Monitor - React Frontend",
+  "version": "1.0.0",
+  "description": "Frontend for GitLab Sync Monitor",
   "private": true,
   "dependencies": {
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "react-router-dom": "^6.20.0",
+    "react-scripts": "5.0.1",
     "socket.io-client": "^4.6.1",
-    "axios": "^1.6.2",
-    "react-scripts": "5.0.1"
+    "web-vitals": "^3.3.1"
   },
   "scripts": {
     "start": "react-scripts start",
@@ -34,5 +33,5 @@
       "last 1 safari version"
     ]
   },
-  "proxy": "http://localhost:3000"
+  "proxy": "http://localhost:3001"
 }

@@ -1,60 +1,50 @@
 # Node modules
-node_modules
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
+node_modules/
+npm-debug.log
+yarn-error.log
 
 # Environment files
 .env
 .env.local
 .env.*.local
 
-# Test files
-**/*.test.js
-**/*.spec.js
-test/
-tests/
-__tests__/
-coverage/
-
 # Development files
-.git
-.gitignore
-.vscode/
-.idea/
-*.md
-!README.md
-
-# Documentation
-docs/
-*.md
-!README.md
-
-# Deployment files (not needed in image)
-deployment/
-openshift/
-kubernetes/
-
-# Data directories (will be mounted)
-data/
-*.db
-*.db-*
-
-# Temporary files
-tmp/
-temp/
-*.tmp
 *.log
+*.pid
+*.seed
+*.pid.lock
 
-# Archives
-*.tar
-*.tar.gz
-*.zip
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
 
 # OS files
 .DS_Store
 Thumbs.db
 
-# Backups
-*.backup
-*.bak
+# Git
+.git/
+.gitignore
+
+# Build output
+build/
+dist/
+
+# Data directories (if local)
+data/
+repos/
+
+# Testing
+coverage/
+.nyc_output/
+
+# Documentation
+*.md
+!README.md
+
+# CI/CD
+.github/
+.gitlab-ci.yml
