@@ -741,6 +741,7 @@ io.on('connection', (socket) => {
 // ==========================================
 
 // 404 handler
+app.get('/', (req, res) => { return res.redirect('/api'); });
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
 });
