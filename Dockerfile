@@ -33,7 +33,7 @@ RUN useradd -r -u 1001 -g 0 nodejs && \
     chmod -R g=u /app
 
 # Switch to non-root user
-USER 1001
+USER 50021
 
 # Expose port
 EXPOSE 3000
