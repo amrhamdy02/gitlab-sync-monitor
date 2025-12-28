@@ -28,12 +28,12 @@ COPY backend/ ./
 RUN mkdir -p /app/monitor/data
 
 # Create non-root user
-RUN useradd -r -u 1001 -g 0 nodejs && \
+RUN useradd -r -u 1002 -g 0 nodejs && \
     chown -R 1001:0 /app && \
     chmod -R g=u /app
 
 # Switch to non-root user
-USER 50021
+USER 1002
 
 # Expose port
 EXPOSE 3000
