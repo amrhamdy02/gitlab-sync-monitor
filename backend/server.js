@@ -103,6 +103,22 @@ const syncEngine = new SecureSyncEngine(db);
 // Apply global API rate limiting
 app.use('/api', apiLimiter);
 
+// ROOT ENDPOINT
+app.get('/', (req, res) => {
+  res.json({
+    name: 'GitLab Sync Monitor',
+    version: '2.0.0',
+    status: 'running',
+    endpoints: {
+      health: '/health',
+      auth: '/api/auth/*',
+      config: '/api/config',
+      webhook: '/api/webhook'
+    }
+  });
+});
+
+
 // Scheduler
 let scheduledTask = null;
 
@@ -736,12 +752,30 @@ io.on('connection', (socket) => {
   });
 });
 
+
+// Serve static frontend files
+app.use(express.static(path.join(__dirname, '../frontend/build')));
+
+// Catch-all route - serve index.html for any non-API routes
+app.get('*', (req, res) => {
+  // Skip API routes
+  if (req.path.startsWith('/api') || req.path === '/health') {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  
+  // Serve index.html for all other routes (SPA support)
+  res.sendFile(path.join(__dirname, '../frontend/build', 'index.html'));
+});
+
+
 // ==========================================
 // ERROR HANDLING
 // ==========================================
 
+
+
+
 // 404 handler
-app.get('/', (req, res) => { return res.redirect('/api'); });
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
 });
