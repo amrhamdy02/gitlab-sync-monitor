@@ -1,703 +1,988 @@
-import React, { useState, useEffect } from 'react';
-import io from 'socket.io-client';
-import './App.css';
+const express = require('express');
+const http = require('http');
+const socketIo = require('socket.io');
+const Database = require('better-sqlite3');
+const cron = require('node-cron');
+const simpleGit = require('simple-git');
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const { Gitlab } = require('@gitbeaker/node');
 
-const API_URL = process.env.REACT_APP_API_URL || '';
-const socket = io(API_URL);
-
-function App() {
-  const [repositories, setRepositories] = useState([]);
-  const [syncHistory, setSyncHistory] = useState([]);
-  const [auditLog, setAuditLog] = useState([]);
-  const [config, setConfig] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [syncing, setSyncing] = useState({});
-  const [activeTab, setActiveTab] = useState('repositories');
-  const [monitorSubTab, setMonitorSubTab] = useState('main');
-  const [notification, setNotification] = useState(null);
-  const [connectionStatus, setConnectionStatus] = useState('connecting');
+// ============================================================================
+// CONFIGURATION - All sensitive data from environment variables
+// ============================================================================
+const CONFIG = {
+  port: process.env.PORT || 3001,
   
-  // Repository view settings
-  const [searchQuery, setSearchQuery] = useState('');
-  const [viewMode, setViewMode] = useState('grid'); // 'grid' or 'list'
+  // GitLab Source Configuration
+  source: {
+    url: process.env.SOURCE_GITLAB_URL,
+    token: process.env.SOURCE_GITLAB_TOKEN,
+    groupId: process.env.SOURCE_GROUP_ID
+  },
+  
+  // GitLab Target Configuration
+  target: {
+    url: process.env.TARGET_GITLAB_URL,
+    token: process.env.TARGET_GITLAB_TOKEN,
+    groupId: process.env.TARGET_GROUP_ID
+  },
+  
+  // Webhook Security
+  webhookSecret: process.env.WEBHOOK_SECRET || crypto.randomBytes(32).toString('hex'),
+  
+  // JWT Configuration
+  jwtSecret: process.env.JWT_SECRET || crypto.randomBytes(64).toString('hex'),
+  
+  // Sync Configuration
+  syncSchedule: process.env.SYNC_SCHEDULE || '0 2 * * *', // 2 AM daily
+  
+  // File Paths
+  dbPath: process.env.DB_PATH || '/data/sync.db',
+  reposPath: process.env.REPOS_PATH || '/data/repos'
+};
 
-  // Show notification
-  const showNotification = (message, type = 'info') => {
-    setNotification({ message, type });
-    setTimeout(() => setNotification(null), 5000);
-  };
+// ============================================================================
+// INITIALIZE EXPRESS AND SOCKET.IO
+// ============================================================================
+const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, {
+  cors: {
+    origin: process.env.CORS_ORIGIN || '*',
+    methods: ['GET', 'POST']
+  }
+});
 
-  // Fetch configuration
-  const fetchConfig = async () => {
-    try {
-      const response = await fetch(`${API_URL}/api/config`);
-      const data = await response.json();
-      setConfig(data);
-    } catch (error) {
-      console.error('Error fetching config:', error);
-      showNotification('Failed to load configuration', 'error');
-    }
-  };
+app.use(express.json());
+app.use(express.static(path.join(__dirname, '../frontend/build')));
 
-  // Fetch repositories
-  const fetchRepositories = async () => {
-    try {
-      const response = await fetch(`${API_URL}/api/repositories`);
-      const data = await response.json();
-      setRepositories(data);
-    } catch (error) {
-      console.error('Error fetching repositories:', error);
-      showNotification('Failed to load repositories', 'error');
-    } finally {
-      setLoading(false);
-    }
-  };
+// ============================================================================
+// DATABASE INITIALIZATION
+// ============================================================================
+function initializeDatabase() {
+  // Ensure data directory exists
+  const dataDir = path.dirname(CONFIG.dbPath);
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+  }
+  
+  // Ensure repos directory exists
+  if (!fs.existsSync(CONFIG.reposPath)) {
+    fs.mkdirSync(CONFIG.reposPath, { recursive: true });
+  }
 
-  // Fetch sync history
-  const fetchSyncHistory = async () => {
-    try {
-      const response = await fetch(`${API_URL}/api/sync/history?limit=50`);
-      const data = await response.json();
-      setSyncHistory(data);
-    } catch (error) {
-      console.error('Error fetching sync history:', error);
-      showNotification('Failed to load sync history', 'error');
-    }
-  };
-
-  // Fetch audit log
-  const fetchAuditLog = async () => {
-    try {
-      const response = await fetch(`${API_URL}/api/audit/commits`);
-      const data = await response.json();
-      setAuditLog(data);
-    } catch (error) {
-      console.error('Error fetching audit log:', error);
-      // Don't show error notification as this is a new feature
-    }
-  };
-
-  // Refresh repository list from GitLab
-  const refreshRepositories = async () => {
-    setLoading(true);
-    showNotification('Refreshing repository list from GitLab...', 'info');
-    
-    try {
-      const response = await fetch(`${API_URL}/api/repositories/refresh`, {
-        method: 'POST'
-      });
-      const data = await response.json();
-      
-      showNotification(`Refreshed ${data.count} repositories`, 'success');
-      await fetchRepositories();
-    } catch (error) {
-      console.error('Error refreshing repositories:', error);
-      showNotification('Failed to refresh repositories', 'error');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // Sync single repository
-  const syncRepository = async (repoId, repoName) => {
-    setSyncing(prev => ({ ...prev, [repoId]: true }));
-    showNotification(`Starting sync for ${repoName}...`, 'info');
-    
-    try {
-      const response = await fetch(`${API_URL}/api/sync/${repoId}`, {
-        method: 'POST'
-      });
-      
-      if (!response.ok) {
-        throw new Error('Sync failed');
-      }
-    } catch (error) {
-      console.error('Error syncing repository:', error);
-      showNotification(`Failed to sync ${repoName}`, 'error');
-      setSyncing(prev => ({ ...prev, [repoId]: false }));
-    }
-  };
-
-  // Sync all repositories
-  const syncAllRepositories = async () => {
-    showNotification('Starting sync for all repositories...', 'info');
-    
-    try {
-      const response = await fetch(`${API_URL}/api/sync/all`, {
-        method: 'POST'
-      });
-      
-      if (!response.ok) {
-        throw new Error('Sync all failed');
-      }
-      
-      showNotification('Bulk sync started in background', 'success');
-    } catch (error) {
-      console.error('Error syncing all repositories:', error);
-      showNotification('Failed to start bulk sync', 'error');
-    }
-  };
-
-  // Filter repositories based on search
-  const filteredRepositories = repositories.filter(repo => {
-    if (!searchQuery) return true;
-    const query = searchQuery.toLowerCase();
-    return (
-      repo.name.toLowerCase().includes(query) ||
-      repo.path.toLowerCase().includes(query) ||
-      (repo.description && repo.description.toLowerCase().includes(query))
+  const db = new Database(CONFIG.dbPath);
+  
+  // Create tables
+  db.exec(`
+    -- Configuration table
+    CREATE TABLE IF NOT EXISTS config (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_url TEXT NOT NULL,
+      source_group_id TEXT NOT NULL,
+      target_url TEXT NOT NULL,
+      target_group_id TEXT NOT NULL,
+      sync_schedule TEXT DEFAULT '0 2 * * *',
+      last_sync DATETIME,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
-  });
-
-  // Filter audit log by branch type
-  const filteredAuditLog = auditLog.filter(commit => {
-    if (monitorSubTab === 'main') {
-      return commit.branch === 'main' || commit.branch === 'master';
-    } else {
-      return commit.branch !== 'main' && commit.branch !== 'master';
-    }
-  });
-
-  // WebSocket event handlers
-  useEffect(() => {
-    socket.on('connect', () => {
-      console.log('WebSocket connected');
-      setConnectionStatus('connected');
-      showNotification('Connected to sync monitor', 'success');
-    });
-
-    socket.on('disconnect', () => {
-      console.log('WebSocket disconnected');
-      setConnectionStatus('disconnected');
-      showNotification('Disconnected from server', 'warning');
-    });
-
-    socket.on('repositories_updated', (data) => {
-      console.log('Repositories updated:', data);
-      fetchRepositories();
-    });
-
-    socket.on('sync_started', (data) => {
-      console.log('Sync started:', data);
-      setSyncing(prev => ({ ...prev, [data.repositoryId]: true }));
-    });
-
-    socket.on('sync_completed', (data) => {
-      console.log('Sync completed:', data);
-      setSyncing(prev => ({ ...prev, [data.repositoryId]: false }));
-      
-      if (data.status === 'success') {
-        showNotification(
-          `✅ ${data.repositoryName} synced successfully (${data.commitCount} commits)`,
-          'success'
-        );
-      } else {
-        showNotification(
-          `❌ ${data.repositoryName} sync failed: ${data.error}`,
-          'error'
-        );
-      }
-      
-      fetchRepositories();
-      fetchSyncHistory();
-      fetchAuditLog();
-    });
-
-    socket.on('sync_all_completed', (data) => {
-      console.log('Sync all completed:', data);
-      showNotification(
-        `Bulk sync completed: ${data.success} successful, ${data.failed} failed`,
-        data.failed > 0 ? 'warning' : 'success'
-      );
-      fetchRepositories();
-      fetchSyncHistory();
-      fetchAuditLog();
-    });
-
-    socket.on('audit_updated', (data) => {
-      console.log('Audit log updated:', data);
-      
-      // Show notification for new commits
-      const forceText = data.isForce ? ' (FORCE PUSH)' : '';
-      showNotification(
-        `📝 New commit${data.commits > 1 ? 's' : ''} to ${data.repository}/${data.branch}${forceText}`,
-        data.isForce ? 'warning' : 'info'
-      );
-      
-      // Refresh audit log
-      fetchAuditLog();
-    });
-
-    return () => {
-      socket.off('connect');
-      socket.off('disconnect');
-      socket.off('repositories_updated');
-      socket.off('sync_started');
-      socket.off('sync_completed');
-      socket.off('sync_all_completed');
-      socket.off('audit_updated');
-    };
-  }, []);
-
-  // Initial data load
-  useEffect(() => {
-    fetchConfig();
-    fetchRepositories();
-    fetchSyncHistory();
-    fetchAuditLog();
-  }, []);
-
-  // Format date/time
-  const formatDateTime = (dateString) => {
-    if (!dateString) return 'Never';
-    const date = new Date(dateString);
-    return date.toLocaleString();
-  };
-
-  // Get status badge
-  const getStatusBadge = (status) => {
-    const badges = {
-      success: { class: 'status-success', icon: '✓', text: 'Success' },
-      failed: { class: 'status-failed', icon: '✗', text: 'Failed' },
-      running: { class: 'status-running', icon: '⟳', text: 'Running' },
-      pending: { class: 'status-pending', icon: '○', text: 'Pending' }
-    };
     
-    const badge = badges[status] || { class: 'status-unknown', icon: '?', text: 'Unknown' };
-    
-    return (
-      <span className={`status-badge ${badge.class}`}>
-        <span className="status-icon">{badge.icon}</span>
-        {badge.text}
-      </span>
+    -- Repositories table
+    CREATE TABLE IF NOT EXISTS repositories (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      gitlab_id INTEGER NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      path TEXT NOT NULL,
+      description TEXT,
+      web_url TEXT,
+      ssh_url TEXT,
+      http_url TEXT,
+      last_activity DATETIME,
+      has_new_commits BOOLEAN DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
-  };
-
-  // Get commit type badge
-  const getCommitTypeBadge = (type) => {
-    const types = {
-      push: { class: 'commit-push', icon: '↑', text: 'Push' },
-      merge: { class: 'commit-merge', icon: '⇄', text: 'Merge' },
-      force: { class: 'commit-force', icon: '⚠', text: 'Force Push' }
-    };
     
-    const badge = types[type] || types.push;
-    
-    return (
-      <span className={`commit-type-badge ${badge.class}`}>
-        <span className="commit-icon">{badge.icon}</span>
-        {badge.text}
-      </span>
+    -- Sync history table
+    CREATE TABLE IF NOT EXISTS sync_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repository_id INTEGER,
+      status TEXT CHECK(status IN ('pending', 'running', 'success', 'failed')),
+      started_at DATETIME,
+      completed_at DATETIME,
+      error_message TEXT,
+      commits_synced INTEGER DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (repository_id) REFERENCES repositories(id)
     );
-  };
-
-  // Repositories Tab - continues in next message due to length
-  const renderRepositories = () => (
-    <div className="repositories-section">
-      <div className="section-header">
-        <h2>Repositories</h2>
-        <div className="header-actions">
-          <div className="search-container">
-            <input
-              type="text"
-              placeholder="🔍 Search repositories..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="search-input"
-            />
-            {searchQuery && (
-              <button 
-                className="clear-search"
-                onClick={() => setSearchQuery('')}
-                title="Clear search"
-              >
-                ×
-              </button>
-            )}
-          </div>
-          
-          <div className="view-toggle">
-            <button
-              className={`view-btn ${viewMode === 'grid' ? 'active' : ''}`}
-              onClick={() => setViewMode('grid')}
-              title="Grid view"
-            >
-              ⊞
-            </button>
-            <button
-              className={`view-btn ${viewMode === 'list' ? 'active' : ''}`}
-              onClick={() => setViewMode('list')}
-              title="List view"
-            >
-              ☰
-            </button>
-          </div>
-          
-          <button 
-            className="btn btn-secondary"
-            onClick={refreshRepositories}
-            disabled={loading}
-          >
-            {loading ? '⟳ Refreshing...' : '↻ Refresh from GitLab'}
-          </button>
-          <button 
-            className="btn btn-primary"
-            onClick={syncAllRepositories}
-            disabled={Object.keys(syncing).some(id => syncing[id])}
-          >
-            🔄 Sync All
-          </button>
-        </div>
-      </div>
-
-      {searchQuery && (
-        <div className="search-results-info">
-          Found {filteredRepositories.length} of {repositories.length} repositories
-        </div>
-      )}
-
-      {loading ? (
-        <div className="loading">
-          <div className="spinner"></div>
-          <p>Loading repositories...</p>
-        </div>
-      ) : filteredRepositories.length === 0 ? (
-        <div className="empty-state">
-          {searchQuery ? (
-            <>
-              <p>No repositories found matching "{searchQuery}"</p>
-              <button className="btn btn-secondary" onClick={() => setSearchQuery('')}>
-                Clear Search
-              </button>
-            </>
-          ) : (
-            <>
-              <p>No repositories found</p>
-              <button className="btn btn-primary" onClick={refreshRepositories}>
-                Refresh Repository List
-              </button>
-            </>
-          )}
-        </div>
-      ) : (
-        <div className={`repositories-${viewMode}`}>
-          {filteredRepositories.map(repo => (
-            <div key={repo.id} className="repo-card">
-              <div className="repo-header">
-                <h3 className="repo-name">{repo.name}</h3>
-                {repo.last_sync_status && getStatusBadge(repo.last_sync_status)}
-              </div>
-              
-              <p className="repo-path">{repo.path}</p>
-              {repo.description && <p className="repo-description">{repo.description}</p>}
-              
-              <div className="repo-meta">
-                <div className="meta-item">
-                  <span className="meta-label">Last Activity:</span>
-                  <span className="meta-value">{formatDateTime(repo.last_activity)}</span>
-                </div>
-                {repo.last_sync_time && (
-                  <div className="meta-item">
-                    <span className="meta-label">Last Sync:</span>
-                    <span className="meta-value">{formatDateTime(repo.last_sync_time)}</span>
-                  </div>
-                )}
-                {repo.last_sync_error && (
-                  <div className="error-message">
-                    ⚠️ {repo.last_sync_error}
-                  </div>
-                )}
-              </div>
-
-              <div className="repo-actions">
-                <a 
-                  href={repo.web_url} 
-                  target="_blank" 
-                  rel="noopener noreferrer"
-                  className="btn btn-link"
-                >
-                  View in GitLab →
-                </a>
-                <button
-                  className="btn btn-primary"
-                  onClick={() => syncRepository(repo.id, repo.name)}
-                  disabled={syncing[repo.id]}
-                >
-                  {syncing[repo.id] ? '⟳ Syncing...' : '🔄 Sync Now'}
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-
-  // Monitor Tab
-  const renderMonitor = () => (
-    <div className="monitor-section">
-      <div className="section-header">
-        <h2>Commit Monitor & Audit Log</h2>
-        <button 
-          className="btn btn-secondary"
-          onClick={fetchAuditLog}
-        >
-          ↻ Refresh
-        </button>
-      </div>
-
-      <div className="monitor-tabs">
-        <button
-          className={`monitor-tab-btn ${monitorSubTab === 'main' ? 'active' : ''}`}
-          onClick={() => setMonitorSubTab('main')}
-        >
-          📌 Main Branch
-        </button>
-        <button
-          className={`monitor-tab-btn ${monitorSubTab === 'other' ? 'active' : ''}`}
-          onClick={() => setMonitorSubTab('other')}
-        >
-          🌿 Other Branches
-        </button>
-      </div>
-
-      {auditLog.length === 0 ? (
-        <div className="empty-state">
-          <p>No commit activity yet</p>
-          <p className="empty-state-hint">Audit log will populate after repositories are synced</p>
-        </div>
-      ) : filteredAuditLog.length === 0 ? (
-        <div className="empty-state">
-          <p>No commits found for {monitorSubTab === 'main' ? 'main branch' : 'other branches'}</p>
-        </div>
-      ) : (
-        <div className="audit-log-container">
-          <table className="audit-table">
-            <thead>
-              <tr>
-                <th>Repository</th>
-                <th>Branch</th>
-                <th>Author</th>
-                <th>Commit</th>
-                <th>Message</th>
-                <th>Type</th>
-                <th>Timestamp</th>
-              </tr>
-            </thead>
-            <tbody>
-              {filteredAuditLog.map((commit, index) => (
-                <tr key={index} className={commit.is_force ? 'force-push-row' : ''}>
-                  <td className="repo-name-cell">{commit.repository}</td>
-                  <td>
-                    <span className="branch-tag">{commit.branch}</span>
-                  </td>
-                  <td className="author-cell">
-                    <div className="author-info">
-                      <div className="author-name">{commit.author_name}</div>
-                      <div className="author-email">{commit.author_email}</div>
-                    </div>
-                  </td>
-                  <td className="commit-sha">
-                    <code>{commit.sha ? commit.sha.substring(0, 8) : 'N/A'}</code>
-                  </td>
-                  <td className="commit-message">{commit.message}</td>
-                  <td>{getCommitTypeBadge(commit.type)}</td>
-                  <td className="timestamp-cell">{formatDateTime(commit.timestamp)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </div>
-  );
-
-  // History & Config tabs continue...
-  const renderSyncHistory = () => (
-    <div className="history-section">
-      <div className="section-header">
-        <h2>Sync History</h2>
-        <button 
-          className="btn btn-secondary"
-          onClick={fetchSyncHistory}
-        >
-          ↻ Refresh
-        </button>
-      </div>
-
-      {syncHistory.length === 0 ? (
-        <div className="empty-state">
-          <p>No sync history yet</p>
-        </div>
-      ) : (
-        <div className="history-table-container">
-          <table className="history-table">
-            <thead>
-              <tr>
-                <th>Repository</th>
-                <th>Status</th>
-                <th>Started</th>
-                <th>Completed</th>
-                <th>Duration</th>
-                <th>Commits</th>
-                <th>Error</th>
-              </tr>
-            </thead>
-            <tbody>
-              {syncHistory.map(sync => {
-                const started = new Date(sync.started_at);
-                const completed = sync.completed_at ? new Date(sync.completed_at) : null;
-                const duration = completed 
-                  ? Math.round((completed - started) / 1000) + 's'
-                  : 'Running';
-
-                return (
-                  <tr key={sync.id}>
-                    <td className="repo-name-cell">{sync.repository_name}</td>
-                    <td>{getStatusBadge(sync.status)}</td>
-                    <td>{formatDateTime(sync.started_at)}</td>
-                    <td>{formatDateTime(sync.completed_at)}</td>
-                    <td>{duration}</td>
-                    <td className="commits-cell">{sync.commits_synced || '-'}</td>
-                    <td className="error-cell">
-                      {sync.error_message && (
-                        <span className="error-tooltip" title={sync.error_message}>
-                          ⚠️
-                        </span>
-                      )}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </div>
-  );
-
-  const renderConfiguration = () => (
-    <div className="config-section">
-      <h2>Configuration</h2>
-      
-      {config ? (
-        <div className="config-grid">
-          <div className="config-card">
-            <h3>Source GitLab</h3>
-            <div className="config-details">
-              <div className="config-item">
-                <span className="config-label">URL:</span>
-                <span className="config-value">{config.source.url}</span>
-              </div>
-              <div className="config-item">
-                <span className="config-label">Group ID:</span>
-                <span className="config-value">{config.source.groupId || 'All projects'}</span>
-              </div>
-            </div>
-          </div>
-
-          <div className="config-card">
-            <h3>Target GitLab</h3>
-            <div className="config-details">
-              <div className="config-item">
-                <span className="config-label">URL:</span>
-                <span className="config-value">{config.target.url}</span>
-              </div>
-              <div className="config-item">
-                <span className="config-label">Group ID:</span>
-                <span className="config-value">{config.target.groupId || 'User namespace'}</span>
-              </div>
-            </div>
-          </div>
-
-          <div className="config-card">
-            <h3>Sync Schedule</h3>
-            <div className="config-details">
-              <div className="config-item">
-                <span className="config-label">Cron Expression:</span>
-                <span className="config-value">{config.syncSchedule}</span>
-              </div>
-              <div className="config-item">
-                <span className="config-label">Description:</span>
-                <span className="config-value">Daily at 2:00 AM</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      ) : (
-        <div className="loading">
-          <div className="spinner"></div>
-          <p>Loading configuration...</p>
-        </div>
-      )}
-    </div>
-  );
-
-  return (
-    <div className="App">
-      <header className="app-header">
-        <h1>🔄 GitLab Sync Monitor</h1>
-        <div className="header-info">
-          <span className={`connection-status ${connectionStatus}`}>
-            {connectionStatus === 'connected' ? '🟢 Connected' : '🔴 Disconnected'}
-          </span>
-          <span className="repo-count">
-            {repositories.length} {repositories.length === 1 ? 'Repository' : 'Repositories'}
-          </span>
-        </div>
-      </header>
-
-      {notification && (
-        <div className={`notification notification-${notification.type}`}>
-          {notification.message}
-          <button 
-            className="notification-close"
-            onClick={() => setNotification(null)}
-          >
-            ×
-          </button>
-        </div>
-      )}
-
-      <nav className="app-nav">
-        <button
-          className={`nav-button ${activeTab === 'repositories' ? 'active' : ''}`}
-          onClick={() => setActiveTab('repositories')}
-        >
-          📚 Repositories
-        </button>
-        <button
-          className={`nav-button ${activeTab === 'monitor' ? 'active' : ''}`}
-          onClick={() => setActiveTab('monitor')}
-        >
-          👁️ Monitor
-        </button>
-        <button
-          className={`nav-button ${activeTab === 'history' ? 'active' : ''}`}
-          onClick={() => setActiveTab('history')}
-        >
-          📜 Sync History
-        </button>
-        <button
-          className={`nav-button ${activeTab === 'config' ? 'active' : ''}`}
-          onClick={() => setActiveTab('config')}
-        >
-          ⚙️ Configuration
-        </button>
-      </nav>
-
-      <main className="app-main">
-        {activeTab === 'repositories' && renderRepositories()}
-        {activeTab === 'monitor' && renderMonitor()}
-        {activeTab === 'history' && renderSyncHistory()}
-        {activeTab === 'config' && renderConfiguration()}
-      </main>
-
-      <footer className="app-footer">
-        <p>GitLab Sync Monitor v1.1 - Enhanced UI & Audit Features</p>
-      </footer>
-    </div>
-  );
+    
+    -- Phase 2: Pending approvals table (for future use)
+    CREATE TABLE IF NOT EXISTS pending_approvals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repository_id INTEGER,
+      event_type TEXT,
+      commit_sha TEXT,
+      commit_message TEXT,
+      author_name TEXT,
+      author_email TEXT,
+      status TEXT CHECK(status IN ('pending', 'approved', 'declined')) DEFAULT 'pending',
+      approved_by TEXT,
+      approved_at DATETIME,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (repository_id) REFERENCES repositories(id)
+    );
+    
+    -- Commit audit log table
+    CREATE TABLE IF NOT EXISTS commit_audit (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repository_id INTEGER,
+      repository_name TEXT,
+      branch TEXT,
+      commit_sha TEXT,
+      commit_message TEXT,
+      author_name TEXT,
+      author_email TEXT,
+      commit_type TEXT CHECK(commit_type IN ('push', 'merge', 'force')),
+      is_force_push BOOLEAN DEFAULT 0,
+      timestamp DATETIME,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (repository_id) REFERENCES repositories(id)
+    );
+    
+    -- Create indexes
+    CREATE INDEX IF NOT EXISTS idx_sync_history_repo ON sync_history(repository_id);
+    CREATE INDEX IF NOT EXISTS idx_sync_history_status ON sync_history(status);
+    CREATE INDEX IF NOT EXISTS idx_pending_approvals_status ON pending_approvals(status);
+    CREATE INDEX IF NOT EXISTS idx_repositories_gitlab_id ON repositories(gitlab_id);
+    CREATE INDEX IF NOT EXISTS idx_commit_audit_repo ON commit_audit(repository_id);
+    CREATE INDEX IF NOT EXISTS idx_commit_audit_branch ON commit_audit(branch);
+    CREATE INDEX IF NOT EXISTS idx_commit_audit_timestamp ON commit_audit(timestamp DESC);
+  `);
+  
+  console.log('✅ Database initialized successfully');
+  return db;
 }
 
-export default App;
+const db = initializeDatabase();
+
+// ============================================================================
+// GITLAB API CLIENTS
+// ============================================================================
+let sourceGitlab, targetGitlab;
+
+function initializeGitlabClients() {
+  if (!CONFIG.source.url || !CONFIG.source.token) {
+    console.error('❌ Source GitLab configuration missing');
+    return false;
+  }
+  
+  if (!CONFIG.target.url || !CONFIG.target.token) {
+    console.error('❌ Target GitLab configuration missing');
+    return false;
+  }
+  
+  try {
+    sourceGitlab = new Gitlab({
+      host: CONFIG.source.url,
+      token: CONFIG.source.token
+    });
+    
+    targetGitlab = new Gitlab({
+      host: CONFIG.target.url,
+      token: CONFIG.target.token
+    });
+    
+    console.log('✅ GitLab clients initialized');
+    
+    // Log group configuration
+    if (CONFIG.source.groupId) {
+      console.log(`   Source: Group ${CONFIG.source.groupId}`);
+    } else {
+      console.log(`   Source: All accessible projects`);
+    }
+    
+    if (CONFIG.target.groupId) {
+      console.log(`   Target: Group ${CONFIG.target.groupId}`);
+    } else {
+      console.log(`   Target: User namespace`);
+    }
+    
+    return true;
+  } catch (error) {
+    console.error('❌ Failed to initialize GitLab clients:', error.message);
+    return false;
+  }
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+// Sanitize repository name for safe file system operations
+function sanitizeRepoName(name) {
+  return name.replace(/[^a-zA-Z0-9-_]/g, '_');
+}
+
+// Verify webhook signature
+function verifyWebhookSignature(payload, receivedToken) {
+  if (!CONFIG.webhookSecret) {
+    console.warn('⚠️ No webhook secret configured, skipping verification');
+    return true; // Allow if no secret configured
+  }
+  
+  if (!receivedToken) {
+    console.warn('⚠️ No token received in webhook');
+    return false;
+  }
+  
+  // GitLab sends the secret token directly in X-Gitlab-Token header
+  // Simple comparison (GitLab doesn't use HMAC by default)
+  return receivedToken === CONFIG.webhookSecret;
+}
+
+// Emit event to all connected clients
+function emitToClients(event, data) {
+  io.emit(event, data);
+  console.log(`📡 Emitted ${event}:`, data);
+}
+
+// ============================================================================
+// DATABASE OPERATIONS (Parameterized queries for SQL injection prevention)
+// ============================================================================
+
+function getRepositories() {
+  const stmt = db.prepare(`
+    SELECT r.*, 
+           sh.status as last_sync_status,
+           sh.completed_at as last_sync_time,
+           sh.error_message as last_sync_error,
+           r.has_new_commits
+    FROM repositories r
+    LEFT JOIN (
+      SELECT repository_id, status, completed_at, error_message,
+             ROW_NUMBER() OVER (PARTITION BY repository_id ORDER BY created_at DESC) as rn
+      FROM sync_history
+    ) sh ON r.id = sh.repository_id AND sh.rn = 1
+    ORDER BY r.last_activity DESC
+  `);
+  
+  return stmt.all();
+}
+
+function getRepository(gitlabId) {
+  const stmt = db.prepare('SELECT * FROM repositories WHERE gitlab_id = ?');
+  return stmt.get(gitlabId);
+}
+
+function upsertRepository(repo) {
+  const existing = getRepository(repo.id);
+  
+  if (existing) {
+    const stmt = db.prepare(`
+      UPDATE repositories 
+      SET name = ?, path = ?, description = ?, web_url = ?, 
+          ssh_url = ?, http_url = ?, last_activity = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE gitlab_id = ?
+    `);
+    
+    stmt.run(
+      repo.name,
+      repo.path_with_namespace,
+      repo.description || '',
+      repo.web_url,
+      repo.ssh_url_to_repo,
+      repo.http_url_to_repo,
+      repo.last_activity_at,
+      repo.id
+    );
+    
+    return existing.id;
+  } else {
+    const stmt = db.prepare(`
+      INSERT INTO repositories (gitlab_id, name, path, description, web_url, ssh_url, http_url, last_activity)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    
+    const result = stmt.run(
+      repo.id,
+      repo.name,
+      repo.path_with_namespace,
+      repo.description || '',
+      repo.web_url,
+      repo.ssh_url_to_repo,
+      repo.http_url_to_repo,
+      repo.last_activity_at
+    );
+    
+    return result.lastInsertRowid;
+  }
+}
+
+function createSyncHistory(repositoryId, status) {
+  const stmt = db.prepare(`
+    INSERT INTO sync_history (repository_id, status, started_at)
+    VALUES (?, ?, CURRENT_TIMESTAMP)
+  `);
+  
+  const result = stmt.run(repositoryId, status);
+  return result.lastInsertRowid;
+}
+
+function updateSyncHistory(syncId, status, error = null, commitCount = 0) {
+  const stmt = db.prepare(`
+    UPDATE sync_history 
+    SET status = ?, completed_at = CURRENT_TIMESTAMP, error_message = ?, commits_synced = ?
+    WHERE id = ?
+  `);
+  
+  stmt.run(status, error, commitCount, syncId);
+}
+
+function getSyncHistory(limit = 50) {
+  const stmt = db.prepare(`
+    SELECT sh.*, r.name as repository_name, r.path as repository_path
+    FROM sync_history sh
+    JOIN repositories r ON sh.repository_id = r.id
+    ORDER BY sh.created_at DESC
+    LIMIT ?
+  `);
+  
+  return stmt.all(limit);
+}
+
+function logCommitsToAudit(repositoryId, repositoryName, commits) {
+  const stmt = db.prepare(`
+    INSERT INTO commit_audit (
+      repository_id, repository_name, branch, commit_sha, commit_message,
+      author_name, author_email, commit_type, is_force_push, timestamp
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  
+  for (const commit of commits) {
+    try {
+      stmt.run(
+        repositoryId,
+        repositoryName,
+        commit.branch || 'unknown',
+        commit.sha,
+        commit.message,
+        commit.author_name,
+        commit.author_email,
+        commit.type || 'push',
+        commit.is_force ? 1 : 0,
+        commit.timestamp || new Date().toISOString()
+      );
+    } catch (error) {
+      console.warn(`Failed to log commit ${commit.sha}:`, error.message);
+    }
+  }
+}
+
+// ============================================================================
+// SYNC OPERATIONS
+// ============================================================================
+
+async function fetchSourceRepositories() {
+  try {
+    let projects;
+    
+    if (CONFIG.source.groupId) {
+      // Fetch projects from specific group
+      console.log(`🔍 Fetching repositories from source group ${CONFIG.source.groupId}...`);
+      projects = await sourceGitlab.GroupProjects.all(CONFIG.source.groupId, {
+        perPage: 100,
+        includeSubgroups: true
+      });
+    } else {
+      // Fetch all projects accessible to the user
+      console.log(`🔍 Fetching all accessible repositories from source...`);
+      projects = await sourceGitlab.Projects.all({
+        perPage: 100,
+        membership: true,  // Only projects user is a member of
+        archived: false    // Exclude archived projects
+      });
+    }
+    
+    console.log(`✅ Found ${projects.length} repositories in source`);
+    
+    // Update database
+    for (const project of projects) {
+      upsertRepository(project);
+    }
+    
+    emitToClients('repositories_updated', { count: projects.length });
+    
+    return projects;
+  } catch (error) {
+    console.error('❌ Error fetching repositories:', error.message);
+    throw error;
+  }
+}
+
+async function syncRepository(repoId) {
+  const repo = db.prepare('SELECT * FROM repositories WHERE id = ?').get(repoId);
+  
+  if (!repo) {
+    throw new Error('Repository not found');
+  }
+  
+  const syncId = createSyncHistory(repoId, 'running');
+  
+  emitToClients('sync_started', {
+    repositoryId: repoId,
+    repositoryName: repo.name,
+    syncId
+  });
+  
+  try {
+    console.log(`🔄 Starting sync for ${repo.name}...`);
+    
+    // Sanitize repository name for local path
+    const localPath = path.join(CONFIG.reposPath, sanitizeRepoName(repo.path));
+    
+    // Ensure parent directory exists
+    const parentDir = path.dirname(localPath);
+    if (!fs.existsSync(parentDir)) {
+      fs.mkdirSync(parentDir, { recursive: true });
+    }
+    
+    const git = simpleGit();
+    
+    // Clone or update local repository
+    if (!fs.existsSync(localPath)) {
+      console.log(`  📥 Cloning ${repo.name}...`);
+      
+      // Construct authenticated source URL
+      const sourceUrl = new URL(repo.http_url);
+      sourceUrl.username = 'oauth2';
+      sourceUrl.password = CONFIG.source.token;
+      
+      await git.clone(sourceUrl.toString(), localPath, {
+        '--mirror': null
+      });
+    } else {
+      console.log(`  🔃 Updating ${repo.name}...`);
+      const repoGit = simpleGit(localPath);
+      await repoGit.fetch(['--all', '--prune']);
+    }
+    
+    // Get target repository or create it
+    let targetRepo;
+    try {
+      if (CONFIG.target.groupId) {
+        // Try to find existing project in specific group
+        const targetProjects = await targetGitlab.GroupProjects.all(CONFIG.target.groupId);
+        targetRepo = targetProjects.find(p => p.path === repo.path.split('/').pop());
+      } else {
+        // Try to find existing project among all accessible projects
+        const targetProjects = await targetGitlab.Projects.all({
+          perPage: 100,
+          membership: true,
+          search: repo.name
+        });
+        targetRepo = targetProjects.find(p => p.path === repo.path.split('/').pop());
+      }
+      
+      if (!targetRepo) {
+        console.log(`  ➕ Creating target repository ${repo.name}...`);
+        const createParams = {
+          name: repo.name,
+          description: repo.description,
+          visibility: 'private'
+        };
+        
+        // Add namespace only if group ID is provided
+        if (CONFIG.target.groupId) {
+          createParams.namespaceId = CONFIG.target.groupId;
+        }
+        
+        targetRepo = await targetGitlab.Projects.create(createParams);
+      }
+    } catch (error) {
+      console.error('  ❌ Error finding/creating target repo:', error.message);
+      throw error;
+    }
+    
+    // Push to target using http URL with token embedded (safer than shell commands)
+    console.log(`  📤 Pushing to target...`);
+    const repoGit = simpleGit(localPath);
+    
+    // Construct authenticated target URL safely
+    const targetUrl = new URL(targetRepo.http_url_to_repo);
+    targetUrl.username = 'oauth2';
+    targetUrl.password = CONFIG.target.token;
+    
+    // Handle protected branches: unprotect, mirror, then re-protect
+    let protectedBranches = [];
+    try {
+      // Get list of protected branches
+      protectedBranches = await targetGitlab.ProtectedBranches.all(targetRepo.id);
+      
+      if (protectedBranches.length > 0) {
+        console.log(`  🔓 Unprotecting ${protectedBranches.length} branches...`);
+        
+        // Unprotect all branches temporarily
+        for (const branch of protectedBranches) {
+          await targetGitlab.ProtectedBranches.unprotect(targetRepo.id, branch.name);
+        }
+      }
+    } catch (error) {
+      console.warn(`  ⚠️ Could not check/unprotect branches: ${error.message}`);
+    }
+    
+    // Push with mirror
+    await repoGit.push(targetUrl.toString(), '--mirror');
+    
+    // Extract and log commits for audit
+    try {
+      const branches = await repoGit.branch(['-r']);
+      const commitData = [];
+      
+      for (const branchName of Object.keys(branches.branches)) {
+        const cleanBranch = branchName.replace('origin/', '');
+        try {
+          const log = await repoGit.log({ [cleanBranch]: null, maxCount: 10 });
+          
+          for (const commit of log.all) {
+            commitData.push({
+              branch: cleanBranch,
+              sha: commit.hash,
+              message: commit.message,
+              author_name: commit.author_name,
+              author_email: commit.author_email,
+              timestamp: commit.date,
+              type: commit.message.toLowerCase().includes('merge') ? 'merge' : 'push',
+              is_force: false
+            });
+          }
+        } catch (branchError) {
+          // Branch might be empty or invalid, skip it
+          console.warn(`  ⚠️ Could not get log for branch ${cleanBranch}`);
+        }
+      }
+      
+      if (commitData.length > 0) {
+        logCommitsToAudit(repoId, repo.name, commitData);
+        console.log(`  📝 Logged ${commitData.length} commits to audit`);
+      }
+    } catch (auditError) {
+      console.warn(`  ⚠️ Could not log commits to audit: ${auditError.message}`);
+    }
+    
+    // Re-protect branches that were protected
+    if (protectedBranches.length > 0) {
+      console.log(`  🔒 Re-protecting ${protectedBranches.length} branches...`);
+      
+      for (const branch of protectedBranches) {
+        try {
+          await targetGitlab.ProtectedBranches.protect(targetRepo.id, branch.name, {
+            pushAccessLevel: branch.push_access_levels?.[0]?.access_level || 40,
+            mergeAccessLevel: branch.merge_access_levels?.[0]?.access_level || 40,
+            unprotectAccessLevel: branch.unprotect_access_levels?.[0]?.access_level || 40
+          });
+        } catch (error) {
+          console.warn(`  ⚠️ Could not re-protect branch ${branch.name}: ${error.message}`);
+        }
+      }
+    }
+    
+    const log = await repoGit.log();
+    const commitCount = log.total || 0;
+    
+    updateSyncHistory(syncId, 'success', null, commitCount);
+    
+    // Clear the "new commits" flag since we just synced
+    db.prepare('UPDATE repositories SET has_new_commits = 0 WHERE id = ?').run(repoId);
+    
+    console.log(`✅ Successfully synced ${repo.name} (${commitCount} commits)`);
+    
+    emitToClients('sync_completed', {
+      repositoryId: repoId,
+      repositoryName: repo.name,
+      syncId,
+      status: 'success',
+      commitCount
+    });
+    
+    return { success: true, commitCount };
+    
+  } catch (error) {
+    console.error(`❌ Error syncing ${repo.name}:`, error.message);
+    
+    updateSyncHistory(syncId, 'failed', error.message);
+    
+    emitToClients('sync_completed', {
+      repositoryId: repoId,
+      repositoryName: repo.name,
+      syncId,
+      status: 'failed',
+      error: error.message
+    });
+    
+    throw error;
+  }
+}
+
+async function syncAllRepositories() {
+  console.log('🚀 Starting sync of all repositories...');
+  
+  const repos = getRepositories();
+  const results = {
+    total: repos.length,
+    success: 0,
+    failed: 0,
+    errors: []
+  };
+  
+  for (const repo of repos) {
+    try {
+      await syncRepository(repo.id);
+      results.success++;
+    } catch (error) {
+      results.failed++;
+      results.errors.push({
+        repository: repo.name,
+        error: error.message
+      });
+    }
+  }
+  
+  console.log(`✅ Sync completed: ${results.success} success, ${results.failed} failed`);
+  
+  emitToClients('sync_all_completed', results);
+  
+  return results;
+}
+
+// ============================================================================
+// REST API ENDPOINTS
+// ============================================================================
+
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    database: db ? 'connected' : 'disconnected',
+    gitlab: sourceGitlab && targetGitlab ? 'connected' : 'disconnected'
+  });
+});
+
+// Get configuration
+app.get('/api/config', (req, res) => {
+  res.json({
+    source: {
+      url: CONFIG.source.url,
+      groupId: CONFIG.source.groupId
+    },
+    target: {
+      url: CONFIG.target.url,
+      groupId: CONFIG.target.groupId
+    },
+    syncSchedule: CONFIG.syncSchedule
+  });
+});
+
+// Get all repositories
+app.get('/api/repositories', (req, res) => {
+  try {
+    const repos = getRepositories();
+    res.json(repos);
+  } catch (error) {
+    console.error('Error fetching repositories:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Refresh repository list from source
+app.post('/api/repositories/refresh', async (req, res) => {
+  try {
+    const projects = await fetchSourceRepositories();
+    res.json({ success: true, count: projects.length });
+  } catch (error) {
+    console.error('Error refreshing repositories:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Sync single repository
+app.post('/api/sync/:repoId', async (req, res) => {
+  try {
+    const repoId = parseInt(req.params.repoId);
+    const result = await syncRepository(repoId);
+    res.json(result);
+  } catch (error) {
+    console.error('Error syncing repository:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Sync all repositories
+app.post('/api/sync/all', async (req, res) => {
+  try {
+    // Start sync in background
+    syncAllRepositories().catch(err => {
+      console.error('Background sync error:', err);
+    });
+    
+    res.json({ success: true, message: 'Sync started' });
+  } catch (error) {
+    console.error('Error starting sync:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get sync history
+app.get('/api/sync/history', (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 50;
+    const history = getSyncHistory(limit);
+    res.json(history);
+  } catch (error) {
+    console.error('Error fetching sync history:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get commit audit log
+app.get('/api/audit/commits', (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 100;
+    const stmt = db.prepare(`
+      SELECT 
+        repository_name as repository,
+        branch,
+        commit_sha as sha,
+        commit_message as message,
+        author_name,
+        author_email,
+        commit_type as type,
+        is_force_push as is_force,
+        timestamp
+      FROM commit_audit
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `);
+    const commits = stmt.all(limit);
+    res.json(commits);
+  } catch (error) {
+    console.error('Error fetching commit audit:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Webhook endpoint - Process GitLab push events for real-time monitoring
+app.post('/api/webhook', (req, res) => {
+  const signature = req.headers['x-gitlab-token'];
+  
+  if (!verifyWebhookSignature(req.body, signature)) {
+    console.warn('⚠️ Invalid webhook signature');
+    return res.status(401).json({ error: 'Invalid signature' });
+  }
+  
+  const event = req.headers['x-gitlab-event'];
+  console.log(`📨 Received webhook: ${event}`);
+  
+  // Handle Push events for commit monitoring
+  if (event === 'Push Hook') {
+    try {
+      const payload = req.body;
+      const projectName = payload.project?.name || 'Unknown';
+      const projectId = payload.project?.id;
+      const ref = payload.ref || '';
+      const branch = ref.replace('refs/heads/', '');
+      const isForce = payload.total_commits_count === 0 && payload.commits?.length === 0;
+      
+      console.log(`  📝 Push to ${projectName}/${branch} (${payload.commits?.length || 0} commits)`);
+      
+      // Find repository in database
+      let repoId = null;
+      if (projectId) {
+        const repo = db.prepare('SELECT id FROM repositories WHERE gitlab_id = ?').get(projectId);
+        repoId = repo?.id;
+        
+        // Mark repository as having new commits (needs sync)
+        if (repoId) {
+          db.prepare('UPDATE repositories SET has_new_commits = 1 WHERE id = ?').run(repoId);
+          
+          // Notify UI to refresh repository list
+          emitToClients('repositories_updated', {
+            repositoryId: repoId,
+            hasNewCommits: true
+          });
+        }
+      }
+      
+      // Log commits to audit
+      if (payload.commits && payload.commits.length > 0) {
+        const commitData = payload.commits.map(commit => ({
+          branch: branch,
+          sha: commit.id,
+          message: commit.message,
+          author_name: commit.author?.name || 'Unknown',
+          author_email: commit.author?.email || '',
+          timestamp: commit.timestamp,
+          type: commit.message?.toLowerCase().includes('merge') ? 'merge' : 'push',
+          is_force: isForce
+        }));
+        
+        logCommitsToAudit(repoId, projectName, commitData);
+        console.log(`  ✅ Logged ${commitData.length} commits to audit`);
+        
+        // Emit to connected clients for real-time update
+        emitToClients('audit_updated', {
+          repository: projectName,
+          branch: branch,
+          commits: commitData.length,
+          isForce: isForce
+        });
+      } else if (isForce) {
+        // Force push with no commits shown (rewrites history)
+        console.log(`  ⚠️ Force push detected on ${branch}`);
+        
+        const forcePushData = [{
+          branch: branch,
+          sha: payload.after || 'unknown',
+          message: `Force push to ${branch}`,
+          author_name: payload.user_name || 'Unknown',
+          author_email: payload.user_email || '',
+          timestamp: new Date().toISOString(),
+          type: 'force',
+          is_force: true
+        }];
+        
+        logCommitsToAudit(repoId, projectName, forcePushData);
+        
+        emitToClients('audit_updated', {
+          repository: projectName,
+          branch: branch,
+          commits: 1,
+          isForce: true
+        });
+      }
+      
+    } catch (error) {
+      console.error('❌ Error processing webhook:', error);
+    }
+  }
+  
+  // Legacy webhook event notification
+  emitToClients('webhook_received', {
+    event,
+    timestamp: new Date().toISOString()
+  });
+  
+  res.json({ success: true });
+});
+
+// Serve frontend for all other routes
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, '../frontend/build', 'index.html'));
+});
+
+// ============================================================================
+// WEBSOCKET CONNECTION
+// ============================================================================
+io.on('connection', (socket) => {
+  console.log('🔌 Client connected:', socket.id);
+  
+  socket.on('disconnect', () => {
+    console.log('🔌 Client disconnected:', socket.id);
+  });
+});
+
+// ============================================================================
+// SCHEDULED SYNC
+// ============================================================================
+let syncTask = null;
+
+function startScheduledSync() {
+  if (syncTask) {
+    syncTask.stop();
+  }
+  
+  console.log(`⏰ Scheduling sync: ${CONFIG.syncSchedule}`);
+  
+  syncTask = cron.schedule(CONFIG.syncSchedule, async () => {
+    console.log('⏰ Running scheduled sync...');
+    try {
+      await syncAllRepositories();
+    } catch (error) {
+      console.error('Scheduled sync error:', error);
+    }
+  });
+}
+
+// ============================================================================
+// SERVER STARTUP
+// ============================================================================
+async function startServer() {
+  try {
+    // Git SSL configuration is handled via GIT_SSL_NO_VERIFY environment variable
+    // Set in Dockerfile, no need to write config file
+    console.log('🔧 Git configured to trust self-signed certificates (via GIT_SSL_NO_VERIFY)');
+    
+    // Initialize GitLab clients
+    const gitlabReady = initializeGitlabClients();
+    
+    if (gitlabReady) {
+      // Fetch initial repository list
+      await fetchSourceRepositories();
+      
+      // Start scheduled sync
+      startScheduledSync();
+    } else {
+      console.warn('⚠️ GitLab clients not initialized. Please check environment variables.');
+    }
+    
+    // Start server
+    server.listen(CONFIG.port, () => {
+      console.log(`
+╔════════════════════════════════════════════════════════════════╗
+║                                                                ║
+║          🚀 GitLab Sync Monitor - Phase 1 (Secure)            ║
+║                                                                ║
+║  Server running on port ${CONFIG.port}                               ║
+║  Environment: ${process.env.NODE_ENV || 'development'}                                ║
+║  Database: ${CONFIG.dbPath}                           ║
+║  Sync Schedule: ${CONFIG.syncSchedule}                           ║
+║                                                                ║
+╚════════════════════════════════════════════════════════════════╝
+      `);
+      
+      console.log('\n📋 Configuration Status:');
+      console.log(`  Source GitLab: ${CONFIG.source.url ? '✅' : '❌'}`);
+      console.log(`  Target GitLab: ${CONFIG.target.url ? '✅' : '❌'}`);
+      console.log(`  Webhook Secret: ${CONFIG.webhookSecret ? '✅' : '❌'}`);
+      console.log(`  JWT Secret: ${CONFIG.jwtSecret ? '✅' : '❌'}\n`);
+    });
+    
+  } catch (error) {
+    console.error('❌ Failed to start server:', error);
+    process.exit(1);
+  }
+}
+
+// ============================================================================
+// GRACEFUL SHUTDOWN
+// ============================================================================
+process.on('SIGTERM', () => {
+  console.log('📴 SIGTERM received. Shutting down gracefully...');
+  
+  if (syncTask) {
+    syncTask.stop();
+  }
+  
+  db.close();
+  
+  server.close(() => {
+    console.log('✅ Server closed');
+    process.exit(0);
+  });
+});
+
+// Start the server
+startServer();
