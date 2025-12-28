@@ -7,29 +7,22 @@ RUN yum install -y python3 make gcc gcc-c++ && \
     yum clean all
 
 # Create app directory
-WORKDIR /app
+WORKDIR /app/monitor
 
-# Copy the application tar file
-COPY gitlab-sync-monitor.tar.gz /tmp/
+# Copy package files first (for better caching)
+COPY backend/package*.json ./
 
-# Extract the application
-RUN cd /tmp && \
-    tar -xzf gitlab-sync-monitor.tar.gz && \
-    mv gitlab-sync-monitor/backend /app/monitor && \
-    rm -rf /tmp/gitlab-sync-monitor.tar.gz /tmp/gitlab-sync-monitor
-
-# Remove any existing node_modules (from local machine)
-RUN rm -rf /app/monitor/node_modules
-
-# Configure npm for proxy environments
+# Configure npm 
 RUN npm config set registry http://registry.npmjs.org/ && \
     npm config set strict-ssl false
 
 # Install dependencies with specific better-sqlite3 version
-WORKDIR /app/monitor
 RUN npm install better-sqlite3@7.6.2 --build-from-source && \
     npm install --only=production && \
     npm cache clean --force
+
+# Copy application code
+COPY backend/ ./
 
 # Create data directory for SQLite database
 RUN mkdir -p /app/monitor/data
