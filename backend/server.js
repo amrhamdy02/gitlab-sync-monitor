@@ -175,6 +175,20 @@ function initializeGitlabClients() {
     });
     
     console.log('✅ GitLab clients initialized');
+    
+    // Log group configuration
+    if (CONFIG.source.groupId) {
+      console.log(`   Source: Group ${CONFIG.source.groupId}`);
+    } else {
+      console.log(`   Source: All accessible projects`);
+    }
+    
+    if (CONFIG.target.groupId) {
+      console.log(`   Target: Group ${CONFIG.target.groupId}`);
+    } else {
+      console.log(`   Target: User namespace`);
+    }
+    
     return true;
   } catch (error) {
     console.error('❌ Failed to initialize GitLab clients:', error.message);
@@ -319,12 +333,24 @@ function getSyncHistory(limit = 50) {
 
 async function fetchSourceRepositories() {
   try {
-    console.log(`🔍 Fetching repositories from source group ${CONFIG.source.groupId}...`);
+    let projects;
     
-    const projects = await sourceGitlab.Groups.allProjects(CONFIG.source.groupId, {
-      include_subgroups: true,
-      per_page: 100
-    });
+    if (CONFIG.source.groupId) {
+      // Fetch projects from specific group
+      console.log(`🔍 Fetching repositories from source group ${CONFIG.source.groupId}...`);
+      projects = await sourceGitlab.GroupProjects.all(CONFIG.source.groupId, {
+        perPage: 100,
+        includeSubgroups: true
+      });
+    } else {
+      // Fetch all projects accessible to the user
+      console.log(`🔍 Fetching all accessible repositories from source...`);
+      projects = await sourceGitlab.Projects.all({
+        perPage: 100,
+        membership: true,  // Only projects user is a member of
+        archived: false    // Exclude archived projects
+      });
+    }
     
     console.log(`✅ Found ${projects.length} repositories in source`);
     
@@ -386,18 +412,34 @@ async function syncRepository(repoId) {
     // Get target repository or create it
     let targetRepo;
     try {
-      // Try to find existing project
-      const targetProjects = await targetGitlab.Groups.allProjects(CONFIG.target.groupId);
-      targetRepo = targetProjects.find(p => p.path === repo.path.split('/').pop());
+      if (CONFIG.target.groupId) {
+        // Try to find existing project in specific group
+        const targetProjects = await targetGitlab.GroupProjects.all(CONFIG.target.groupId);
+        targetRepo = targetProjects.find(p => p.path === repo.path.split('/').pop());
+      } else {
+        // Try to find existing project among all accessible projects
+        const targetProjects = await targetGitlab.Projects.all({
+          perPage: 100,
+          membership: true,
+          search: repo.name
+        });
+        targetRepo = targetProjects.find(p => p.path === repo.path.split('/').pop());
+      }
       
       if (!targetRepo) {
         console.log(`  ➕ Creating target repository ${repo.name}...`);
-        targetRepo = await targetGitlab.Projects.create({
+        const createParams = {
           name: repo.name,
-          namespace_id: CONFIG.target.groupId,
           description: repo.description,
           visibility: 'private'
-        });
+        };
+        
+        // Add namespace only if group ID is provided
+        if (CONFIG.target.groupId) {
+          createParams.namespaceId = CONFIG.target.groupId;
+        }
+        
+        targetRepo = await targetGitlab.Projects.create(createParams);
       }
     } catch (error) {
       console.error('  ❌ Error finding/creating target repo:', error.message);
