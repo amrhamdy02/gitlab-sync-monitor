@@ -214,6 +214,20 @@ function App() {
       fetchAuditLog();
     });
 
+    socket.on('audit_updated', (data) => {
+      console.log('Audit log updated:', data);
+      
+      // Show notification for new commits
+      const forceText = data.isForce ? ' (FORCE PUSH)' : '';
+      showNotification(
+        `📝 New commit${data.commits > 1 ? 's' : ''} to ${data.repository}/${data.branch}${forceText}`,
+        data.isForce ? 'warning' : 'info'
+      );
+      
+      // Refresh audit log
+      fetchAuditLog();
+    });
+
     return () => {
       socket.off('connect');
       socket.off('disconnect');
@@ -221,6 +235,7 @@ function App() {
       socket.off('sync_started');
       socket.off('sync_completed');
       socket.off('sync_all_completed');
+      socket.off('audit_updated');
     };
   }, []);
 
