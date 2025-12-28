@@ -67,11 +67,14 @@ COPY --from=frontend-builder /app/frontend/build ./frontend/build
 COPY backend/server.js ./backend/
 
 # Create required directories with proper permissions
-RUN mkdir -p /data/repos && \
-    chown -R appuser:appuser /app /data
+RUN mkdir -p /data/repos /home/appuser && \
+    chown -R appuser:appuser /app /data /home/appuser
 
 # Switch to non-root user
 USER appuser
+
+# Set HOME environment variable for git config
+ENV HOME=/home/appuser
 
 # Expose port
 EXPOSE 3001
