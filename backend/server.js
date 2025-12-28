@@ -1,804 +1,698 @@
-require('dotenv').config();
 const express = require('express');
 const http = require('http');
-const { Server } = require('socket.io');
-const cors = require('cors');
-const helmet = require('helmet');
-const morgan = require('morgan');
+const socketIo = require('socket.io');
+const Database = require('better-sqlite3');
 const cron = require('node-cron');
+const simpleGit = require('simple-git');
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const { Gitlab } = require('@gitbeaker/node');
 
-// Security utilities
-const validator = require('./utils/input-validator');
-const passwordValidator = require('./utils/password-validator');
-const jwtManager = require('./utils/jwt-manager');
+// ============================================================================
+// CONFIGURATION - All sensitive data from environment variables
+// ============================================================================
+const CONFIG = {
+  port: process.env.PORT || 3001,
+  
+  // GitLab Source Configuration
+  source: {
+    url: process.env.SOURCE_GITLAB_URL,
+    token: process.env.SOURCE_GITLAB_TOKEN,
+    groupId: process.env.SOURCE_GROUP_ID
+  },
+  
+  // GitLab Target Configuration
+  target: {
+    url: process.env.TARGET_GITLAB_URL,
+    token: process.env.TARGET_GITLAB_TOKEN,
+    groupId: process.env.TARGET_GROUP_ID
+  },
+  
+  // Webhook Security
+  webhookSecret: process.env.WEBHOOK_SECRET || crypto.randomBytes(32).toString('hex'),
+  
+  // JWT Configuration
+  jwtSecret: process.env.JWT_SECRET || crypto.randomBytes(64).toString('hex'),
+  
+  // Sync Configuration
+  syncSchedule: process.env.SYNC_SCHEDULE || '0 2 * * *', // 2 AM daily
+  
+  // File Paths
+  dbPath: process.env.DB_PATH || './data/sync.db',
+  reposPath: process.env.REPOS_PATH || './data/repos'
+};
 
-// Middleware
-const { requireAuth, requireAdmin } = require('./middleware/auth');
-const { validateWebhook } = require('./middleware/webhook-auth');
-const { 
-  apiLimiter, 
-  authLimiter, 
-  webhookLimiter, 
-  strictLimiter 
-} = require('./middleware/rate-limit');
-
-// Services
-const DatabaseManager = require('./database-secure');
-const GitLabService = require('./gitlab-service');
-const SecureSyncEngine = require('./sync-engine-secure');
-
-// Initialize Express
+// ============================================================================
+// INITIALIZE EXPRESS AND SOCKET.IO
+// ============================================================================
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
+const io = socketIo(server, {
   cors: {
     origin: process.env.CORS_ORIGIN || '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE']
+    methods: ['GET', 'POST']
   }
 });
 
-// Security headers
-app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: ["'self'"],
-      styleSrc: ["'self'", "'unsafe-inline'"],
-      imgSrc: ["'self'", "data:", "https:"],
-      connectSrc: ["'self'", "wss:", "ws:"],
-      fontSrc: ["'self'"],
-      objectSrc: ["'none'"],
-      mediaSrc: ["'self'"],
-      frameSrc: ["'none'"]
-    }
-  },
-  hsts: {
-    maxAge: 31536000,
-    includeSubDomains: true,
-    preload: true
-  }
-}));
+app.use(express.json());
+app.use(express.static(path.join(__dirname, '../frontend/build')));
 
-// Additional security headers
-app.use((req, res, next) => {
-  res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-XSS-Protection', '1; mode=block');
-  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
-  
-  // Cache control for API
-  if (req.path.startsWith('/api')) {
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
+// ============================================================================
+// DATABASE INITIALIZATION
+// ============================================================================
+function initializeDatabase() {
+  // Ensure data directory exists
+  const dataDir = path.dirname(CONFIG.dbPath);
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
   }
   
-  next();
-});
-
-// CORS
-app.use(cors());
-
-// Body parser with size limits
-app.use(express.json({ limit: '100kb' }));
-app.use(express.urlencoded({ extended: true, limit: '100kb' }));
-
-// Logging (sanitized)
-morgan.token('sanitized-body', (req) => {
-  if (req.body && Object.keys(req.body).length > 0) {
-    const sanitized = validator.sanitizeForLog(req.body);
-    return JSON.stringify(sanitized);
+  // Ensure repos directory exists
+  if (!fs.existsSync(CONFIG.reposPath)) {
+    fs.mkdirSync(CONFIG.reposPath, { recursive: true });
   }
-  return '-';
-});
 
-app.use(morgan(':method :url :status :response-time ms - :sanitized-body'));
-
-// Initialize database
-const db = new DatabaseManager(process.env.DB_PATH || '/data/sync-monitor.db');
-
-// Initialize sync engine
-const syncEngine = new SecureSyncEngine(db);
-
-// Apply global API rate limiting
-app.use('/api', apiLimiter);
-
-// Scheduler
-let scheduledTask = null;
-
-// ==========================================
-// HEALTH & STATUS ENDPOINTS
-// ==========================================
-
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    database: 'connected'
-  });
-});
-
-app.get('/api/status', requireAuth, (req, res) => {
-  res.json({
-    status: 'running',
-    version: '2.0.0',
-    user: {
-      id: req.user.id,
-      username: req.user.username,
-      role: req.user.role
-    },
-    timestamp: new Date().toISOString()
-  });
-});
-
-// ==========================================
-// AUTHENTICATION ENDPOINTS
-// ==========================================
-
-// Register new user
-app.post('/api/auth/register', authLimiter, async (req, res) => {
-  try {
-    const { username, email, password, role } = req.body;
-
-    // Validate inputs
-    validator.validateUsername(username);
-    validator.validateEmail(email);
-    passwordValidator.validate(password);
-    passwordValidator.validateAgainstUsername(password, username);
-
-    // Hash password
-    const passwordHash = await passwordValidator.hash(password);
-
-    // Create user
-    const userId = db.createUser({
-      username,
-      email,
-      password_hash: passwordHash,
-      role: role === 'admin' ? 'admin' : 'user' // Only allow admin if explicitly set
-    });
-
-    // Log audit
-    db.createAuditLog({
-      userId: userId,
-      action: 'USER_REGISTERED',
-      resource_type: 'user',
-      resource_id: userId.toString(),
-      ipAddress: req.ip,
-      userAgent: req.get('user-agent')
-    });
-
-    res.json({ 
-      success: true, 
-      userId,
-      message: 'User created successfully' 
-    });
-  } catch (error) {
-    console.error('Registration error:', error.message);
-    res.status(400).json({ error: error.message });
-  }
-});
-
-// Login
-app.post('/api/auth/login', authLimiter, async (req, res) => {
-  try {
-    const { username, password } = req.body;
-
-    if (!username || !password) {
-      return res.status(400).json({ error: 'Username and password required' });
-    }
-
-    // Get user
-    const user = db.getUserByUsername(username);
-    
-    if (!user) {
-      // Log failed attempt
-      db.createAuditLog({
-        action: 'LOGIN_FAILED',
-        resource_type: 'auth',
-        details: `Failed login attempt for username: ${username}`,
-        ipAddress: req.ip,
-        userAgent: req.get('user-agent')
-      });
-      
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    // Verify password
-    const isValid = await passwordValidator.verify(password, user.password_hash);
-    
-    if (!isValid) {
-      // Log failed attempt
-      db.createAuditLog({
-        userId: user.id,
-        action: 'LOGIN_FAILED',
-        resource_type: 'auth',
-        details: 'Invalid password',
-        ipAddress: req.ip,
-        userAgent: req.get('user-agent')
-      });
-      
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    // Check if password needs rehashing
-    if (passwordValidator.needsRehash(user.password_hash)) {
-      const newHash = await passwordValidator.hash(password);
-      db.updateUserPassword(user.id, newHash);
-    }
-
-    // Generate session
-    const sessionId = jwtManager.generateSessionId();
-    
-    // Create session in database
-    db.createSession({
-      sessionId,
-      userId: user.id,
-      ipAddress: req.ip,
-      userAgent: req.get('user-agent'),
-      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString() // 7 days
-    });
-
-    // Generate tokens
-    const tokens = jwtManager.generateTokenPair(user, sessionId);
-
-    // Log successful login
-    db.createAuditLog({
-      userId: user.id,
-      action: 'LOGIN_SUCCESS',
-      resource_type: 'auth',
-      ipAddress: req.ip,
-      userAgent: req.get('user-agent')
-    });
-
-    res.json({
-      success: true,
-      ...tokens,
-      user: {
-        id: user.id,
-        username: user.username,
-        email: user.email,
-        role: user.role
-      }
-    });
-  } catch (error) {
-    console.error('Login error:', error.message);
-    res.status(500).json({ error: 'Login failed' });
-  }
-});
-
-// Logout
-app.post('/api/auth/logout', requireAuth, (req, res) => {
-  try {
-    // Delete session
-    db.deleteSession(req.user.sessionId);
-    
-    // Log logout
-    db.createAuditLog({
-      userId: req.user.id,
-      action: 'LOGOUT',
-      resource_type: 'auth',
-      ipAddress: req.ip,
-      userAgent: req.get('user-agent')
-    });
-    
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Logout error:', error.message);
-    res.status(500).json({ error: 'Logout failed' });
-  }
-});
-
-// Refresh token
-app.post('/api/auth/refresh', async (req, res) => {
-  try {
-    const { refreshToken } = req.body;
-    
-    if (!refreshToken) {
-      return res.status(401).json({ error: 'Refresh token required' });
-    }
-
-    // Verify refresh token
-    const decoded = jwtManager.verifyRefreshToken(refreshToken);
-    
-    // Check session still valid
-    const session = db.getSession(decoded.sessionId);
-    if (!session) {
-      return res.status(401).json({ error: 'Session expired' });
-    }
-
-    // Get user
-    const user = db.getUserById(decoded.userId);
-    if (!user) {
-      return res.status(401).json({ error: 'User not found' });
-    }
-
-    // Generate new access token
-    const accessToken = jwtManager.generateAccessToken(user, decoded.sessionId);
-
-    res.json({
-      success: true,
-      accessToken,
-      expiresIn: 900 // 15 minutes
-    });
-  } catch (error) {
-    console.error('Token refresh error:', error.message);
-    res.status(401).json({ error: 'Token refresh failed' });
-  }
-});
-
-// ==========================================
-// CONFIGURATION ENDPOINTS
-// ==========================================
-
-// Get configuration
-app.get('/api/config', requireAuth, (req, res) => {
-  try {
-    const config = db.getConfig();
-    
-    // NEVER send tokens to client
-    if (config) {
-      delete config.source_token;
-      delete config.target_token;
-    }
-    
-    res.json(config || {});
-  } catch (error) {
-    console.error('Error fetching config:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Update configuration
-app.post('/api/config', requireAuth, requireAdmin, strictLimiter, async (req, res) => {
-  try {
-    const config = req.body;
-
-    // Validate required fields
-    validator.validateString(config.source_gitlab_url, 2048, 'source_gitlab_url');
-    validator.validateString(config.target_gitlab_url, 2048, 'target_gitlab_url');
-
-    // Validate cron expression if provided
-    if (config.cron_schedule) {
-      validator.validateCronExpression(config.cron_schedule);
-      
-      if (!cron.validate(config.cron_schedule)) {
-        return res.status(400).json({ error: 'Invalid cron schedule expression' });
-      }
-    }
-
-    // Save configuration (tokens come from env vars, not request)
-    db.upsertConfig({
-      source_gitlab_url: config.source_gitlab_url,
-      source_group_id: config.source_group_id || null,
-      target_gitlab_url: config.target_gitlab_url,
-      target_group_id: config.target_group_id || null,
-      cron_schedule: config.cron_schedule || '0 */6 * * *',
-      retry_attempts: config.retry_attempts || 3,
-      retry_delay_seconds: config.retry_delay_seconds || 60,
-      enabled: config.enabled !== undefined ? (config.enabled ? 1 : 0) : 1
-    });
-
-    // Log configuration change
-    db.createAuditLog({
-      userId: req.user.id,
-      action: 'CONFIG_UPDATED',
-      resource_type: 'config',
-      details: JSON.stringify({ cron_schedule: config.cron_schedule }),
-      ipAddress: req.ip,
-      userAgent: req.get('user-agent')
-    });
-
-    // Update scheduler
-    setupScheduler();
-
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Error updating config:', error.message);
-    res.status(400).json({ error: error.message });
-  }
-});
-
-// ==========================================
-// WEBHOOK ENDPOINT
-// ==========================================
-
-app.post('/api/webhook', webhookLimiter, validateWebhook, async (req, res) => {
-  try {
-    const payload = req.body;
-    
-    // Create pending repository from webhook
-    const repoId = db.createPendingRepository({
-      repository_id: payload.project.id.toString(),
-      repository_name: payload.project.name,
-      repository_url: payload.project.http_url_to_repo || payload.project.web_url,
-      event_type: payload.object_kind,
-      author_name: payload.user_name || payload.user?.name,
-      author_email: payload.user_email || payload.user?.email,
-      commit_message: payload.commits?.[0]?.message,
-      commit_sha: payload.commits?.[0]?.id,
-      webhook_payload: JSON.stringify(payload)
-    });
-
-    // Emit to connected clients
-    io.emit('new_pending_repository', {
-      id: repoId,
-      repository: payload.project.name,
-      author: payload.user_name || payload.user?.name,
-      event: payload.object_kind,
-      timestamp: new Date().toISOString()
-    });
-
-    console.log('Webhook processed:', {
-      repository: payload.project.name,
-      event: payload.object_kind,
-      id: repoId
-    });
-
-    res.json({ success: true, id: repoId });
-  } catch (error) {
-    console.error('Webhook processing error:', error.message);
-    res.status(500).json({ error: 'Failed to process webhook' });
-  }
-});
-
-// ==========================================
-// PENDING REPOSITORIES ENDPOINTS
-// ==========================================
-
-// Get pending repositories
-app.get('/api/pending', requireAuth, (req, res) => {
-  try {
-    const status = req.query.status || 'pending';
-    
-    // Validate status
-    validator.validateEnum(
-      status,
-      ['pending', 'approved', 'declined', 'synced', 'failed'],
-      'status'
+  const db = new Database(CONFIG.dbPath);
+  
+  // Create tables
+  db.exec(`
+    -- Configuration table
+    CREATE TABLE IF NOT EXISTS config (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_url TEXT NOT NULL,
+      source_group_id TEXT NOT NULL,
+      target_url TEXT NOT NULL,
+      target_group_id TEXT NOT NULL,
+      sync_schedule TEXT DEFAULT '0 2 * * *',
+      last_sync DATETIME,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
-
-    const repos = db.getPendingRepositories(status);
-    res.json(repos);
-  } catch (error) {
-    console.error('Error fetching pending repos:', error.message);
-    res.status(400).json({ error: error.message });
-  }
-});
-
-// Approve repository
-app.post('/api/pending/:id/approve', requireAuth, strictLimiter, async (req, res) => {
-  try {
-    const id = validator.validateId(req.params.id);
-
-    // Update status
-    db.updatePendingRepository(id, {
-      status: 'approved',
-      approved_by: req.user.id,
-      approved_at: new Date().toISOString()
-    });
-
-    // Log approval
-    db.createAuditLog({
-      userId: req.user.id,
-      action: 'REPOSITORY_APPROVED',
-      resource_type: 'pending_repository',
-      resource_id: id.toString(),
-      ipAddress: req.ip,
-      userAgent: req.get('user-agent')
-    });
-
-    // Emit to connected clients
-    io.emit('repository_approved', { id });
-
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Error approving repository:', error.message);
-    res.status(400).json({ error: error.message });
-  }
-});
-
-// Decline repository
-app.post('/api/pending/:id/decline', requireAuth, strictLimiter, async (req, res) => {
-  try {
-    const id = validator.validateId(req.params.id);
-    const { reason } = req.body;
-
-    // Update status
-    db.updatePendingRepository(id, {
-      status: 'declined',
-      declined_by: req.user.id,
-      declined_at: new Date().toISOString(),
-      decline_reason: reason || null
-    });
-
-    // Log decline
-    db.createAuditLog({
-      userId: req.user.id,
-      action: 'REPOSITORY_DECLINED',
-      resource_type: 'pending_repository',
-      resource_id: id.toString(),
-      details: reason,
-      ipAddress: req.ip,
-      userAgent: req.get('user-agent')
-    });
-
-    // Emit to connected clients
-    io.emit('repository_declined', { id });
-
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Error declining repository:', error.message);
-    res.status(400).json({ error: error.message });
-  }
-});
-
-// ==========================================
-// SYNC ENDPOINTS
-// ==========================================
-
-// Get sync history
-app.get('/api/sync/history', requireAuth, (req, res) => {
-  try {
-    const limit = parseInt(req.query.limit) || 10;
-    const offset = parseInt(req.query.offset) || 0;
-
-    const history = db.getSyncHistory(limit, offset);
-    res.json(history);
-  } catch (error) {
-    console.error('Error fetching sync history:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get sync details
-app.get('/api/sync/:id', requireAuth, (req, res) => {
-  try {
-    const id = validator.validateId(req.params.id);
-
-    const sync = db.getSyncById(id);
-    if (!sync) {
-      return res.status(404).json({ error: 'Sync not found' });
-    }
-
-    const details = db.getRepoSyncDetailsBySyncId(id);
-    const logs = db.getSyncLogs(id);
-
-    res.json({
-      ...sync,
-      details,
-      logs
-    });
-  } catch (error) {
-    console.error('Error fetching sync details:', error.message);
-    res.status(400).json({ error: error.message });
-  }
-});
-
-// Trigger manual sync
-app.post('/api/sync/manual', requireAuth, strictLimiter, async (req, res) => {
-  try {
-    // Log sync trigger
-    db.createAuditLog({
-      userId: req.user.id,
-      action: 'MANUAL_SYNC_TRIGGERED',
-      resource_type: 'sync',
-      ipAddress: req.ip,
-      userAgent: req.get('user-agent')
-    });
-
-    // Run sync in background
-    runSync().catch(error => {
-      console.error('Manual sync error:', error);
-    });
-
-    res.json({ 
-      success: true,
-      message: 'Sync started' 
-    });
-  } catch (error) {
-    console.error('Error triggering manual sync:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ==========================================
-// AUDIT LOG ENDPOINTS
-// ==========================================
-
-app.get('/api/audit', requireAuth, requireAdmin, (req, res) => {
-  try {
-    const limit = parseInt(req.query.limit) || 100;
-    const offset = parseInt(req.query.offset) || 0;
-
-    const logs = db.getAuditLogs(limit, offset);
-    res.json(logs);
-  } catch (error) {
-    console.error('Error fetching audit logs:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ==========================================
-// SYNC ENGINE
-// ==========================================
-
-async function runSync() {
-  console.log('Starting sync operation...');
-
-  try {
-    // Validate prerequisites
-    const validation = await syncEngine.validatePrerequisites();
-    if (!validation.valid) {
-      console.error('Sync prerequisites not met:', validation.errors);
-      throw new Error('Prerequisites not met: ' + validation.errors.join(', '));
-    }
-
-    // Get config
-    const config = db.getConfig();
-    if (!config || !config.enabled) {
-      console.log('Sync disabled or not configured');
-      return;
-    }
-
-    // Get tokens from environment (NEVER from database)
-    const sourceToken = process.env.SOURCE_GITLAB_TOKEN;
-    const targetToken = process.env.TARGET_GITLAB_TOKEN;
-
-    if (!sourceToken || !targetToken) {
-      throw new Error('GitLab tokens not configured in environment');
-    }
-
-    // Initialize GitLab service
-    const gitlabService = new GitLabService(config.source_gitlab_url, sourceToken);
-
-    // Get repositories
-    const repositories = await gitlabService.getGroupRepositories(config.source_group_id);
-
-    console.log(`Found ${repositories.length} repositories to sync`);
-
-    // Emit sync started event
-    io.emit('sync_started', {
-      total: repositories.length,
-      timestamp: new Date().toISOString()
-    });
-
-    // Perform sync
-    const results = await syncEngine.performFullSync(repositories, sourceToken, targetToken);
-
-    // Emit sync completed event
-    io.emit('sync_completed', {
-      ...results,
-      timestamp: new Date().toISOString()
-    });
-
-    console.log('Sync completed:', results);
-
-    return results;
-  } catch (error) {
-    console.error('Sync error:', error.message);
     
-    io.emit('sync_failed', {
-      error: error.message,
-      timestamp: new Date().toISOString()
-    });
+    -- Repositories table
+    CREATE TABLE IF NOT EXISTS repositories (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      gitlab_id INTEGER NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      path TEXT NOT NULL,
+      description TEXT,
+      web_url TEXT,
+      ssh_url TEXT,
+      http_url TEXT,
+      last_activity DATETIME,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    -- Sync history table
+    CREATE TABLE IF NOT EXISTS sync_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repository_id INTEGER,
+      status TEXT CHECK(status IN ('pending', 'running', 'success', 'failed')),
+      started_at DATETIME,
+      completed_at DATETIME,
+      error_message TEXT,
+      commits_synced INTEGER DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (repository_id) REFERENCES repositories(id)
+    );
+    
+    -- Phase 2: Pending approvals table (for future use)
+    CREATE TABLE IF NOT EXISTS pending_approvals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repository_id INTEGER,
+      event_type TEXT,
+      commit_sha TEXT,
+      commit_message TEXT,
+      author_name TEXT,
+      author_email TEXT,
+      status TEXT CHECK(status IN ('pending', 'approved', 'declined')) DEFAULT 'pending',
+      approved_by TEXT,
+      approved_at DATETIME,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (repository_id) REFERENCES repositories(id)
+    );
+    
+    -- Create indexes
+    CREATE INDEX IF NOT EXISTS idx_sync_history_repo ON sync_history(repository_id);
+    CREATE INDEX IF NOT EXISTS idx_sync_history_status ON sync_history(status);
+    CREATE INDEX IF NOT EXISTS idx_pending_approvals_status ON pending_approvals(status);
+    CREATE INDEX IF NOT EXISTS idx_repositories_gitlab_id ON repositories(gitlab_id);
+  `);
+  
+  console.log('✅ Database initialized successfully');
+  return db;
+}
 
+const db = initializeDatabase();
+
+// ============================================================================
+// GITLAB API CLIENTS
+// ============================================================================
+let sourceGitlab, targetGitlab;
+
+function initializeGitlabClients() {
+  if (!CONFIG.source.url || !CONFIG.source.token) {
+    console.error('❌ Source GitLab configuration missing');
+    return false;
+  }
+  
+  if (!CONFIG.target.url || !CONFIG.target.token) {
+    console.error('❌ Target GitLab configuration missing');
+    return false;
+  }
+  
+  try {
+    sourceGitlab = new Gitlab({
+      host: CONFIG.source.url,
+      token: CONFIG.source.token
+    });
+    
+    targetGitlab = new Gitlab({
+      host: CONFIG.target.url,
+      token: CONFIG.target.token
+    });
+    
+    console.log('✅ GitLab clients initialized');
+    return true;
+  } catch (error) {
+    console.error('❌ Failed to initialize GitLab clients:', error.message);
+    return false;
+  }
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+// Sanitize repository name for safe file system operations
+function sanitizeRepoName(name) {
+  return name.replace(/[^a-zA-Z0-9-_]/g, '_');
+}
+
+// Verify webhook signature
+function verifyWebhookSignature(payload, signature) {
+  if (!CONFIG.webhookSecret) return false;
+  
+  const hmac = crypto.createHmac('sha256', CONFIG.webhookSecret);
+  const digest = hmac.update(JSON.stringify(payload)).digest('hex');
+  
+  return crypto.timingSafeEqual(
+    Buffer.from(signature),
+    Buffer.from(digest)
+  );
+}
+
+// Emit event to all connected clients
+function emitToClients(event, data) {
+  io.emit(event, data);
+  console.log(`📡 Emitted ${event}:`, data);
+}
+
+// ============================================================================
+// DATABASE OPERATIONS (Parameterized queries for SQL injection prevention)
+// ============================================================================
+
+function getRepositories() {
+  const stmt = db.prepare(`
+    SELECT r.*, 
+           sh.status as last_sync_status,
+           sh.completed_at as last_sync_time,
+           sh.error_message as last_sync_error
+    FROM repositories r
+    LEFT JOIN (
+      SELECT repository_id, status, completed_at, error_message,
+             ROW_NUMBER() OVER (PARTITION BY repository_id ORDER BY created_at DESC) as rn
+      FROM sync_history
+    ) sh ON r.id = sh.repository_id AND sh.rn = 1
+    ORDER BY r.last_activity DESC
+  `);
+  
+  return stmt.all();
+}
+
+function getRepository(gitlabId) {
+  const stmt = db.prepare('SELECT * FROM repositories WHERE gitlab_id = ?');
+  return stmt.get(gitlabId);
+}
+
+function upsertRepository(repo) {
+  const existing = getRepository(repo.id);
+  
+  if (existing) {
+    const stmt = db.prepare(`
+      UPDATE repositories 
+      SET name = ?, path = ?, description = ?, web_url = ?, 
+          ssh_url = ?, http_url = ?, last_activity = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE gitlab_id = ?
+    `);
+    
+    stmt.run(
+      repo.name,
+      repo.path_with_namespace,
+      repo.description || '',
+      repo.web_url,
+      repo.ssh_url_to_repo,
+      repo.http_url_to_repo,
+      repo.last_activity_at,
+      repo.id
+    );
+    
+    return existing.id;
+  } else {
+    const stmt = db.prepare(`
+      INSERT INTO repositories (gitlab_id, name, path, description, web_url, ssh_url, http_url, last_activity)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    
+    const result = stmt.run(
+      repo.id,
+      repo.name,
+      repo.path_with_namespace,
+      repo.description || '',
+      repo.web_url,
+      repo.ssh_url_to_repo,
+      repo.http_url_to_repo,
+      repo.last_activity_at
+    );
+    
+    return result.lastInsertRowid;
+  }
+}
+
+function createSyncHistory(repositoryId, status) {
+  const stmt = db.prepare(`
+    INSERT INTO sync_history (repository_id, status, started_at)
+    VALUES (?, ?, CURRENT_TIMESTAMP)
+  `);
+  
+  const result = stmt.run(repositoryId, status);
+  return result.lastInsertRowid;
+}
+
+function updateSyncHistory(syncId, status, error = null, commitCount = 0) {
+  const stmt = db.prepare(`
+    UPDATE sync_history 
+    SET status = ?, completed_at = CURRENT_TIMESTAMP, error_message = ?, commits_synced = ?
+    WHERE id = ?
+  `);
+  
+  stmt.run(status, error, commitCount, syncId);
+}
+
+function getSyncHistory(limit = 50) {
+  const stmt = db.prepare(`
+    SELECT sh.*, r.name as repository_name, r.path as repository_path
+    FROM sync_history sh
+    JOIN repositories r ON sh.repository_id = r.id
+    ORDER BY sh.created_at DESC
+    LIMIT ?
+  `);
+  
+  return stmt.all(limit);
+}
+
+// ============================================================================
+// SYNC OPERATIONS
+// ============================================================================
+
+async function fetchSourceRepositories() {
+  try {
+    console.log(`🔍 Fetching repositories from source group ${CONFIG.source.groupId}...`);
+    
+    const projects = await sourceGitlab.Groups.allProjects(CONFIG.source.groupId, {
+      include_subgroups: true,
+      per_page: 100
+    });
+    
+    console.log(`✅ Found ${projects.length} repositories in source`);
+    
+    // Update database
+    for (const project of projects) {
+      upsertRepository(project);
+    }
+    
+    emitToClients('repositories_updated', { count: projects.length });
+    
+    return projects;
+  } catch (error) {
+    console.error('❌ Error fetching repositories:', error.message);
     throw error;
   }
 }
 
-// ==========================================
-// SCHEDULER
-// ==========================================
-
-function setupScheduler() {
-  // Stop existing task
-  if (scheduledTask) {
-    scheduledTask.stop();
-    scheduledTask = null;
-  }
-
-  const config = db.getConfig();
+async function syncRepository(repoId) {
+  const repo = db.prepare('SELECT * FROM repositories WHERE id = ?').get(repoId);
   
-  if (!config || !config.enabled) {
-    console.log('Scheduler disabled');
-    return;
+  if (!repo) {
+    throw new Error('Repository not found');
   }
-
-  const schedule = config.cron_schedule || '0 */6 * * *';
   
-  if (!cron.validate(schedule)) {
-    console.error('Invalid cron schedule:', schedule);
-    return;
-  }
-
-  scheduledTask = cron.schedule(schedule, () => {
-    console.log('Running scheduled sync at', new Date().toISOString());
-    runSync().catch(error => {
-      console.error('Scheduled sync error:', error.message);
-    });
+  const syncId = createSyncHistory(repoId, 'running');
+  
+  emitToClients('sync_started', {
+    repositoryId: repoId,
+    repositoryName: repo.name,
+    syncId
   });
-
-  console.log('Scheduler configured with schedule:', schedule);
+  
+  try {
+    console.log(`🔄 Starting sync for ${repo.name}...`);
+    
+    // Sanitize repository name for local path
+    const localPath = path.join(CONFIG.reposPath, sanitizeRepoName(repo.path));
+    
+    // Ensure parent directory exists
+    const parentDir = path.dirname(localPath);
+    if (!fs.existsSync(parentDir)) {
+      fs.mkdirSync(parentDir, { recursive: true });
+    }
+    
+    const git = simpleGit();
+    
+    // Clone or update local repository
+    if (!fs.existsSync(localPath)) {
+      console.log(`  📥 Cloning ${repo.name}...`);
+      await git.clone(repo.http_url, localPath, {
+        '--mirror': null
+      });
+    } else {
+      console.log(`  🔃 Updating ${repo.name}...`);
+      const repoGit = simpleGit(localPath);
+      await repoGit.fetch(['--all', '--prune']);
+    }
+    
+    // Get target repository or create it
+    let targetRepo;
+    try {
+      // Try to find existing project
+      const targetProjects = await targetGitlab.Groups.allProjects(CONFIG.target.groupId);
+      targetRepo = targetProjects.find(p => p.path === repo.path.split('/').pop());
+      
+      if (!targetRepo) {
+        console.log(`  ➕ Creating target repository ${repo.name}...`);
+        targetRepo = await targetGitlab.Projects.create({
+          name: repo.name,
+          namespace_id: CONFIG.target.groupId,
+          description: repo.description,
+          visibility: 'private'
+        });
+      }
+    } catch (error) {
+      console.error('  ❌ Error finding/creating target repo:', error.message);
+      throw error;
+    }
+    
+    // Push to target using http URL with token embedded (safer than shell commands)
+    console.log(`  📤 Pushing to target...`);
+    const repoGit = simpleGit(localPath);
+    
+    // Construct authenticated target URL safely
+    const targetUrl = new URL(targetRepo.http_url_to_repo);
+    targetUrl.username = 'oauth2';
+    targetUrl.password = CONFIG.target.token;
+    
+    await repoGit.push(targetUrl.toString(), '--mirror');
+    
+    const log = await repoGit.log();
+    const commitCount = log.total || 0;
+    
+    updateSyncHistory(syncId, 'success', null, commitCount);
+    
+    console.log(`✅ Successfully synced ${repo.name} (${commitCount} commits)`);
+    
+    emitToClients('sync_completed', {
+      repositoryId: repoId,
+      repositoryName: repo.name,
+      syncId,
+      status: 'success',
+      commitCount
+    });
+    
+    return { success: true, commitCount };
+    
+  } catch (error) {
+    console.error(`❌ Error syncing ${repo.name}:`, error.message);
+    
+    updateSyncHistory(syncId, 'failed', error.message);
+    
+    emitToClients('sync_completed', {
+      repositoryId: repoId,
+      repositoryName: repo.name,
+      syncId,
+      status: 'failed',
+      error: error.message
+    });
+    
+    throw error;
+  }
 }
 
-// Initialize scheduler on startup
-setupScheduler();
+async function syncAllRepositories() {
+  console.log('🚀 Starting sync of all repositories...');
+  
+  const repos = getRepositories();
+  const results = {
+    total: repos.length,
+    success: 0,
+    failed: 0,
+    errors: []
+  };
+  
+  for (const repo of repos) {
+    try {
+      await syncRepository(repo.id);
+      results.success++;
+    } catch (error) {
+      results.failed++;
+      results.errors.push({
+        repository: repo.name,
+        error: error.message
+      });
+    }
+  }
+  
+  console.log(`✅ Sync completed: ${results.success} success, ${results.failed} failed`);
+  
+  emitToClients('sync_all_completed', results);
+  
+  return results;
+}
 
-// ==========================================
-// WEBSOCKET
-// ==========================================
+// ============================================================================
+// REST API ENDPOINTS
+// ============================================================================
 
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    database: db ? 'connected' : 'disconnected',
+    gitlab: sourceGitlab && targetGitlab ? 'connected' : 'disconnected'
+  });
+});
+
+// Get configuration
+app.get('/api/config', (req, res) => {
+  res.json({
+    source: {
+      url: CONFIG.source.url,
+      groupId: CONFIG.source.groupId
+    },
+    target: {
+      url: CONFIG.target.url,
+      groupId: CONFIG.target.groupId
+    },
+    syncSchedule: CONFIG.syncSchedule
+  });
+});
+
+// Get all repositories
+app.get('/api/repositories', (req, res) => {
+  try {
+    const repos = getRepositories();
+    res.json(repos);
+  } catch (error) {
+    console.error('Error fetching repositories:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Refresh repository list from source
+app.post('/api/repositories/refresh', async (req, res) => {
+  try {
+    const projects = await fetchSourceRepositories();
+    res.json({ success: true, count: projects.length });
+  } catch (error) {
+    console.error('Error refreshing repositories:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Sync single repository
+app.post('/api/sync/:repoId', async (req, res) => {
+  try {
+    const repoId = parseInt(req.params.repoId);
+    const result = await syncRepository(repoId);
+    res.json(result);
+  } catch (error) {
+    console.error('Error syncing repository:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Sync all repositories
+app.post('/api/sync/all', async (req, res) => {
+  try {
+    // Start sync in background
+    syncAllRepositories().catch(err => {
+      console.error('Background sync error:', err);
+    });
+    
+    res.json({ success: true, message: 'Sync started' });
+  } catch (error) {
+    console.error('Error starting sync:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get sync history
+app.get('/api/sync/history', (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 50;
+    const history = getSyncHistory(limit);
+    res.json(history);
+  } catch (error) {
+    console.error('Error fetching sync history:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Webhook endpoint (Phase 2 - for future approval workflow)
+app.post('/api/webhook', (req, res) => {
+  const signature = req.headers['x-gitlab-token'];
+  
+  if (!verifyWebhookSignature(req.body, signature)) {
+    console.warn('⚠️ Invalid webhook signature');
+    return res.status(401).json({ error: 'Invalid signature' });
+  }
+  
+  const event = req.headers['x-gitlab-event'];
+  console.log(`📨 Received webhook: ${event}`);
+  
+  // Phase 2: Handle webhook for approval workflow
+  // For now, just log it
+  emitToClients('webhook_received', {
+    event,
+    timestamp: new Date().toISOString()
+  });
+  
+  res.json({ success: true });
+});
+
+// Serve frontend for all other routes
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, '../frontend/build', 'index.html'));
+});
+
+// ============================================================================
+// WEBSOCKET CONNECTION
+// ============================================================================
 io.on('connection', (socket) => {
-  console.log('Client connected:', socket.id);
-
+  console.log('🔌 Client connected:', socket.id);
+  
   socket.on('disconnect', () => {
-    console.log('Client disconnected:', socket.id);
+    console.log('🔌 Client disconnected:', socket.id);
   });
 });
 
-// ==========================================
-// ERROR HANDLING
-// ==========================================
+// ============================================================================
+// SCHEDULED SYNC
+// ============================================================================
+let syncTask = null;
 
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({ error: 'Not found' });
-});
-
-// Error handler
-app.use((error, req, res, next) => {
-  // Log full error server-side
-  console.error('Error:', {
-    message: error.message,
-    stack: error.stack,
-    path: req.path,
-    method: req.method,
-    user: req.user?.username,
-    ip: req.ip
-  });
+function startScheduledSync() {
+  if (syncTask) {
+    syncTask.stop();
+  }
   
-  // Send sanitized error to client
-  const isProduction = process.env.NODE_ENV === 'production';
+  console.log(`⏰ Scheduling sync: ${CONFIG.syncSchedule}`);
   
-  res.status(error.status || 500).json({
-    error: isProduction ? 'Internal server error' : error.message,
-    ...(isProduction ? {} : { stack: error.stack })
+  syncTask = cron.schedule(CONFIG.syncSchedule, async () => {
+    console.log('⏰ Running scheduled sync...');
+    try {
+      await syncAllRepositories();
+    } catch (error) {
+      console.error('Scheduled sync error:', error);
+    }
   });
-});
+}
 
-// ==========================================
-// START SERVER
-// ==========================================
+// ============================================================================
+// SERVER STARTUP
+// ============================================================================
+async function startServer() {
+  try {
+    // Initialize GitLab clients
+    const gitlabReady = initializeGitlabClients();
+    
+    if (gitlabReady) {
+      // Fetch initial repository list
+      await fetchSourceRepositories();
+      
+      // Start scheduled sync
+      startScheduledSync();
+    } else {
+      console.warn('⚠️ GitLab clients not initialized. Please check environment variables.');
+    }
+    
+    // Start server
+    server.listen(CONFIG.port, () => {
+      console.log(`
+╔════════════════════════════════════════════════════════════════╗
+║                                                                ║
+║          🚀 GitLab Sync Monitor - Phase 1 (Secure)            ║
+║                                                                ║
+║  Server running on port ${CONFIG.port}                               ║
+║  Environment: ${process.env.NODE_ENV || 'development'}                                ║
+║  Database: ${CONFIG.dbPath}                           ║
+║  Sync Schedule: ${CONFIG.syncSchedule}                           ║
+║                                                                ║
+╚════════════════════════════════════════════════════════════════╝
+      `);
+      
+      console.log('\n📋 Configuration Status:');
+      console.log(`  Source GitLab: ${CONFIG.source.url ? '✅' : '❌'}`);
+      console.log(`  Target GitLab: ${CONFIG.target.url ? '✅' : '❌'}`);
+      console.log(`  Webhook Secret: ${CONFIG.webhookSecret ? '✅' : '❌'}`);
+      console.log(`  JWT Secret: ${CONFIG.jwtSecret ? '✅' : '❌'}\n`);
+    });
+    
+  } catch (error) {
+    console.error('❌ Failed to start server:', error);
+    process.exit(1);
+  }
+}
 
-const PORT = process.env.PORT || 3000;
-
-server.listen(PORT, '0.0.0.0', () => {
-  console.log('========================================');
-  console.log('GitLab Sync Monitor - Secure v2.0.0');
-  console.log('========================================');
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`Database: ${process.env.DB_PATH || '/data/sync-monitor.db'}`);
-  console.log('========================================');
-});
-
-// ==========================================
+// ============================================================================
 // GRACEFUL SHUTDOWN
-// ==========================================
-
+// ============================================================================
 process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down gracefully');
+  console.log('📴 SIGTERM received. Shutting down gracefully...');
   
-  if (scheduledTask) {
-    scheduledTask.stop();
+  if (syncTask) {
+    syncTask.stop();
   }
   
   db.close();
   
   server.close(() => {
-    console.log('Server closed');
+    console.log('✅ Server closed');
     process.exit(0);
   });
 });
 
-module.exports = { app, server, io };
+// Start the server
+startServer();
