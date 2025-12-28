@@ -8,12 +8,18 @@ const socket = io(API_URL);
 function App() {
   const [repositories, setRepositories] = useState([]);
   const [syncHistory, setSyncHistory] = useState([]);
+  const [auditLog, setAuditLog] = useState([]);
   const [config, setConfig] = useState(null);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState({});
   const [activeTab, setActiveTab] = useState('repositories');
+  const [monitorSubTab, setMonitorSubTab] = useState('main');
   const [notification, setNotification] = useState(null);
   const [connectionStatus, setConnectionStatus] = useState('connecting');
+  
+  // Repository view settings
+  const [searchQuery, setSearchQuery] = useState('');
+  const [viewMode, setViewMode] = useState('grid'); // 'grid' or 'list'
 
   // Show notification
   const showNotification = (message, type = 'info') => {
@@ -59,6 +65,18 @@ function App() {
     }
   };
 
+  // Fetch audit log
+  const fetchAuditLog = async () => {
+    try {
+      const response = await fetch(`${API_URL}/api/audit/commits`);
+      const data = await response.json();
+      setAuditLog(data);
+    } catch (error) {
+      console.error('Error fetching audit log:', error);
+      // Don't show error notification as this is a new feature
+    }
+  };
+
   // Refresh repository list from GitLab
   const refreshRepositories = async () => {
     setLoading(true);
@@ -93,8 +111,6 @@ function App() {
       if (!response.ok) {
         throw new Error('Sync failed');
       }
-      
-      // Don't show success notification here - will come from WebSocket
     } catch (error) {
       console.error('Error syncing repository:', error);
       showNotification(`Failed to sync ${repoName}`, 'error');
@@ -121,6 +137,26 @@ function App() {
       showNotification('Failed to start bulk sync', 'error');
     }
   };
+
+  // Filter repositories based on search
+  const filteredRepositories = repositories.filter(repo => {
+    if (!searchQuery) return true;
+    const query = searchQuery.toLowerCase();
+    return (
+      repo.name.toLowerCase().includes(query) ||
+      repo.path.toLowerCase().includes(query) ||
+      (repo.description && repo.description.toLowerCase().includes(query))
+    );
+  });
+
+  // Filter audit log by branch type
+  const filteredAuditLog = auditLog.filter(commit => {
+    if (monitorSubTab === 'main') {
+      return commit.branch === 'main' || commit.branch === 'master';
+    } else {
+      return commit.branch !== 'main' && commit.branch !== 'master';
+    }
+  });
 
   // WebSocket event handlers
   useEffect(() => {
@@ -164,6 +200,7 @@ function App() {
       
       fetchRepositories();
       fetchSyncHistory();
+      fetchAuditLog();
     });
 
     socket.on('sync_all_completed', (data) => {
@@ -174,6 +211,7 @@ function App() {
       );
       fetchRepositories();
       fetchSyncHistory();
+      fetchAuditLog();
     });
 
     return () => {
@@ -191,6 +229,7 @@ function App() {
     fetchConfig();
     fetchRepositories();
     fetchSyncHistory();
+    fetchAuditLog();
   }, []);
 
   // Format date/time
@@ -219,12 +258,66 @@ function App() {
     );
   };
 
-  // Repositories Tab
+  // Get commit type badge
+  const getCommitTypeBadge = (type) => {
+    const types = {
+      push: { class: 'commit-push', icon: '↑', text: 'Push' },
+      merge: { class: 'commit-merge', icon: '⇄', text: 'Merge' },
+      force: { class: 'commit-force', icon: '⚠', text: 'Force Push' }
+    };
+    
+    const badge = types[type] || types.push;
+    
+    return (
+      <span className={`commit-type-badge ${badge.class}`}>
+        <span className="commit-icon">{badge.icon}</span>
+        {badge.text}
+      </span>
+    );
+  };
+
+  // Repositories Tab - continues in next message due to length
   const renderRepositories = () => (
     <div className="repositories-section">
       <div className="section-header">
         <h2>Repositories</h2>
         <div className="header-actions">
+          <div className="search-container">
+            <input
+              type="text"
+              placeholder="🔍 Search repositories..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="search-input"
+            />
+            {searchQuery && (
+              <button 
+                className="clear-search"
+                onClick={() => setSearchQuery('')}
+                title="Clear search"
+              >
+                ×
+              </button>
+            )}
+          </div>
+          
+          <div className="view-toggle">
+            <button
+              className={`view-btn ${viewMode === 'grid' ? 'active' : ''}`}
+              onClick={() => setViewMode('grid')}
+              title="Grid view"
+            >
+              ⊞
+            </button>
+            <button
+              className={`view-btn ${viewMode === 'list' ? 'active' : ''}`}
+              onClick={() => setViewMode('list')}
+              title="List view"
+            >
+              ☰
+            </button>
+          </div>
+          
           <button 
             className="btn btn-secondary"
             onClick={refreshRepositories}
@@ -242,21 +335,38 @@ function App() {
         </div>
       </div>
 
+      {searchQuery && (
+        <div className="search-results-info">
+          Found {filteredRepositories.length} of {repositories.length} repositories
+        </div>
+      )}
+
       {loading ? (
         <div className="loading">
           <div className="spinner"></div>
           <p>Loading repositories...</p>
         </div>
-      ) : repositories.length === 0 ? (
+      ) : filteredRepositories.length === 0 ? (
         <div className="empty-state">
-          <p>No repositories found</p>
-          <button className="btn btn-primary" onClick={refreshRepositories}>
-            Refresh Repository List
-          </button>
+          {searchQuery ? (
+            <>
+              <p>No repositories found matching "{searchQuery}"</p>
+              <button className="btn btn-secondary" onClick={() => setSearchQuery('')}>
+                Clear Search
+              </button>
+            </>
+          ) : (
+            <>
+              <p>No repositories found</p>
+              <button className="btn btn-primary" onClick={refreshRepositories}>
+                Refresh Repository List
+              </button>
+            </>
+          )}
         </div>
       ) : (
-        <div className="repositories-grid">
-          {repositories.map(repo => (
+        <div className={`repositories-${viewMode}`}>
+          {filteredRepositories.map(repo => (
             <div key={repo.id} className="repo-card">
               <div className="repo-header">
                 <h3 className="repo-name">{repo.name}</h3>
@@ -308,7 +418,86 @@ function App() {
     </div>
   );
 
-  // Sync History Tab
+  // Monitor Tab
+  const renderMonitor = () => (
+    <div className="monitor-section">
+      <div className="section-header">
+        <h2>Commit Monitor & Audit Log</h2>
+        <button 
+          className="btn btn-secondary"
+          onClick={fetchAuditLog}
+        >
+          ↻ Refresh
+        </button>
+      </div>
+
+      <div className="monitor-tabs">
+        <button
+          className={`monitor-tab-btn ${monitorSubTab === 'main' ? 'active' : ''}`}
+          onClick={() => setMonitorSubTab('main')}
+        >
+          📌 Main Branch
+        </button>
+        <button
+          className={`monitor-tab-btn ${monitorSubTab === 'other' ? 'active' : ''}`}
+          onClick={() => setMonitorSubTab('other')}
+        >
+          🌿 Other Branches
+        </button>
+      </div>
+
+      {auditLog.length === 0 ? (
+        <div className="empty-state">
+          <p>No commit activity yet</p>
+          <p className="empty-state-hint">Audit log will populate after repositories are synced</p>
+        </div>
+      ) : filteredAuditLog.length === 0 ? (
+        <div className="empty-state">
+          <p>No commits found for {monitorSubTab === 'main' ? 'main branch' : 'other branches'}</p>
+        </div>
+      ) : (
+        <div className="audit-log-container">
+          <table className="audit-table">
+            <thead>
+              <tr>
+                <th>Repository</th>
+                <th>Branch</th>
+                <th>Author</th>
+                <th>Commit</th>
+                <th>Message</th>
+                <th>Type</th>
+                <th>Timestamp</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredAuditLog.map((commit, index) => (
+                <tr key={index} className={commit.is_force ? 'force-push-row' : ''}>
+                  <td className="repo-name-cell">{commit.repository}</td>
+                  <td>
+                    <span className="branch-tag">{commit.branch}</span>
+                  </td>
+                  <td className="author-cell">
+                    <div className="author-info">
+                      <div className="author-name">{commit.author_name}</div>
+                      <div className="author-email">{commit.author_email}</div>
+                    </div>
+                  </td>
+                  <td className="commit-sha">
+                    <code>{commit.sha ? commit.sha.substring(0, 8) : 'N/A'}</code>
+                  </td>
+                  <td className="commit-message">{commit.message}</td>
+                  <td>{getCommitTypeBadge(commit.type)}</td>
+                  <td className="timestamp-cell">{formatDateTime(commit.timestamp)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+
+  // History & Config tabs continue...
   const renderSyncHistory = () => (
     <div className="history-section">
       <div className="section-header">
@@ -372,7 +561,6 @@ function App() {
     </div>
   );
 
-  // Configuration Tab
   const renderConfiguration = () => (
     <div className="config-section">
       <h2>Configuration</h2>
@@ -388,7 +576,7 @@ function App() {
               </div>
               <div className="config-item">
                 <span className="config-label">Group ID:</span>
-                <span className="config-value">{config.source.groupId}</span>
+                <span className="config-value">{config.source.groupId || 'All projects'}</span>
               </div>
             </div>
           </div>
@@ -402,7 +590,7 @@ function App() {
               </div>
               <div className="config-item">
                 <span className="config-label">Group ID:</span>
-                <span className="config-value">{config.target.groupId}</span>
+                <span className="config-value">{config.target.groupId || 'User namespace'}</span>
               </div>
             </div>
           </div>
@@ -427,21 +615,6 @@ function App() {
           <p>Loading configuration...</p>
         </div>
       )}
-
-      <div className="env-instructions">
-        <h3>Environment Variables</h3>
-        <p>This application uses environment variables for configuration. Required variables:</p>
-        <ul>
-          <li><code>SOURCE_GITLAB_URL</code> - Source GitLab instance URL</li>
-          <li><code>SOURCE_GITLAB_TOKEN</code> - Source GitLab personal access token</li>
-          <li><code>SOURCE_GROUP_ID</code> - Source group ID to sync from</li>
-          <li><code>TARGET_GITLAB_URL</code> - Target GitLab instance URL</li>
-          <li><code>TARGET_GITLAB_TOKEN</code> - Target GitLab personal access token</li>
-          <li><code>TARGET_GROUP_ID</code> - Target group ID to sync to</li>
-          <li><code>WEBHOOK_SECRET</code> - Secret for webhook signature verification (optional)</li>
-          <li><code>JWT_SECRET</code> - Secret for JWT token generation (optional)</li>
-        </ul>
-      </div>
     </div>
   );
 
@@ -479,6 +652,12 @@ function App() {
           📚 Repositories
         </button>
         <button
+          className={`nav-button ${activeTab === 'monitor' ? 'active' : ''}`}
+          onClick={() => setActiveTab('monitor')}
+        >
+          👁️ Monitor
+        </button>
+        <button
           className={`nav-button ${activeTab === 'history' ? 'active' : ''}`}
           onClick={() => setActiveTab('history')}
         >
@@ -494,12 +673,13 @@ function App() {
 
       <main className="app-main">
         {activeTab === 'repositories' && renderRepositories()}
+        {activeTab === 'monitor' && renderMonitor()}
         {activeTab === 'history' && renderSyncHistory()}
         {activeTab === 'config' && renderConfiguration()}
       </main>
 
       <footer className="app-footer">
-        <p>GitLab Sync Monitor v1.0 - Phase 1 (Security Hardened)</p>
+        <p>GitLab Sync Monitor v1.1 - Enhanced UI & Audit Features</p>
       </footer>
     </div>
   );
