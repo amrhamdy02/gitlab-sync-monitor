@@ -76,6 +76,9 @@ USER appuser
 # Set HOME environment variable for git config
 ENV HOME=/home/appuser
 
+# Git SSL configuration via environment variable (no file write needed)
+ENV GIT_SSL_NO_VERIFY=1
+
 # Expose port
 EXPOSE 3001
 
