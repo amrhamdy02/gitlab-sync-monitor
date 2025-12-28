@@ -5,7 +5,7 @@
 
 # ============================================================================
 # Stage 1: Build Frontend
-# ===========================================================================
+# ============================================================================
 FROM node:18-alpine AS frontend-builder
 
 WORKDIR /app/frontend
@@ -82,6 +82,10 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
 
 # Set working directory to backend
 WORKDIR /app/backend
+
+# Environment variable for corporate SSL certificates (if needed)
+# Can be overridden via deployment env vars
+ENV NODE_TLS_REJECT_UNAUTHORIZED=0
 
 # Use tini as init system (handles signals properly)
 ENTRYPOINT ["/sbin/tini", "--"]
