@@ -400,7 +400,13 @@ async function syncRepository(repoId) {
     // Clone or update local repository
     if (!fs.existsSync(localPath)) {
       console.log(`  📥 Cloning ${repo.name}...`);
-      await git.clone(repo.http_url, localPath, {
+      
+      // Construct authenticated source URL
+      const sourceUrl = new URL(repo.http_url);
+      sourceUrl.username = 'oauth2';
+      sourceUrl.password = CONFIG.source.token;
+      
+      await git.clone(sourceUrl.toString(), localPath, {
         '--mirror': null
       });
     } else {
