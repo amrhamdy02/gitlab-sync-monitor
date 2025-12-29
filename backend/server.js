@@ -1,96 +1,83 @@
+// ============================================================================
+// GitLab Sync Monitor - Complete Single-File Version
+// Combines: Modular logic + Security hardening + Storage optimization
+// ============================================================================
+
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
-const socketIo = require('socket.io');
+const { Server } = require('socket.io');
+const cors = require('cors');
+const { Gitlab } = require('@gitbeaker/node');
 const Database = require('better-sqlite3');
 const cron = require('node-cron');
-const simpleGit = require('simple-git');
+const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
-const crypto = require('crypto');
-const { Gitlab } = require('@gitbeaker/node');
+const simpleGit = require('simple-git');
 
 // ============================================================================
-// CONFIGURATION - All sensitive data from environment variables
+// CONFIGURATION
 // ============================================================================
 const CONFIG = {
   port: process.env.PORT || 3001,
   
-  // GitLab Source Configuration
+  // GitLab Source
   source: {
     url: process.env.SOURCE_GITLAB_URL,
     token: process.env.SOURCE_GITLAB_TOKEN,
-    groupId: process.env.SOURCE_GROUP_ID
+    groupId: process.env.SOURCE_GROUP_ID || null
   },
   
-  // GitLab Target Configuration
+  // GitLab Target
   target: {
     url: process.env.TARGET_GITLAB_URL,
     token: process.env.TARGET_GITLAB_TOKEN,
-    groupId: process.env.TARGET_GROUP_ID
+    groupId: process.env.TARGET_GROUP_ID || null
   },
   
   // Webhook Security
   webhookSecret: process.env.WEBHOOK_SECRET || process.env.gitlab_webhook_secret || crypto.randomBytes(32).toString('hex'),
   
-  // JWT Configuration
-  jwtSecret: process.env.JWT_SECRET || crypto.randomBytes(64).toString('hex'),
-  
-  // Sync Configuration
-  syncSchedule: process.env.SYNC_SCHEDULE || '0 2 * * *', // 2 AM daily
-  
-  // File Paths
+  // Paths
   dbPath: process.env.DB_PATH || '/data/sync.db',
-  reposPath: process.env.REPOS_PATH || '/data/repos'
+  
+  // Settings
+  disableScheduledSync: process.env.DISABLE_SCHEDULED_SYNC === 'true',
+  auditRetentionDays: parseInt(process.env.AUDIT_RETENTION_DAYS) || 90
 };
 
 // ============================================================================
-// INITIALIZE EXPRESS AND SOCKET.IO
+// EXPRESS & SOCKET.IO SETUP
 // ============================================================================
 const app = express();
 const server = http.createServer(app);
-const io = socketIo(server, {
+const io = new Server(server, {
   cors: {
-    origin: process.env.CORS_ORIGIN || '*',
+    origin: '*',
     methods: ['GET', 'POST']
   }
 });
 
-app.use(express.json());
+// Middleware
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// Serve static frontend
 app.use(express.static(path.join(__dirname, '../frontend/build')));
 
 // ============================================================================
 // DATABASE INITIALIZATION
 // ============================================================================
-function initializeDatabase() {
-  // Ensure data directory exists
-  const dataDir = path.dirname(CONFIG.dbPath);
-  if (!fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir, { recursive: true });
-  }
-  
-  // Ensure repos directory exists
-  if (!fs.existsSync(CONFIG.reposPath)) {
-    fs.mkdirSync(CONFIG.reposPath, { recursive: true });
-  }
+let db;
 
-  const db = new Database(CONFIG.dbPath);
+function initializeDatabase() {
+  db = new Database(CONFIG.dbPath);
+  db.pragma('journal_mode = WAL');
   
   // Create tables
   db.exec(`
-    -- Configuration table
-    CREATE TABLE IF NOT EXISTS config (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      source_url TEXT NOT NULL,
-      source_group_id TEXT NOT NULL,
-      target_url TEXT NOT NULL,
-      target_group_id TEXT NOT NULL,
-      sync_schedule TEXT DEFAULT '0 2 * * *',
-      last_sync DATETIME,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-    
-    -- Repositories table
     CREATE TABLE IF NOT EXISTS repositories (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       gitlab_id INTEGER NOT NULL UNIQUE,
@@ -106,7 +93,6 @@ function initializeDatabase() {
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
     
-    -- Sync history table
     CREATE TABLE IF NOT EXISTS sync_history (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       repository_id INTEGER,
@@ -119,23 +105,6 @@ function initializeDatabase() {
       FOREIGN KEY (repository_id) REFERENCES repositories(id)
     );
     
-    -- Phase 2: Pending approvals table (for future use)
-    CREATE TABLE IF NOT EXISTS pending_approvals (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      repository_id INTEGER,
-      event_type TEXT,
-      commit_sha TEXT,
-      commit_message TEXT,
-      author_name TEXT,
-      author_email TEXT,
-      status TEXT CHECK(status IN ('pending', 'approved', 'declined')) DEFAULT 'pending',
-      approved_by TEXT,
-      approved_at DATETIME,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (repository_id) REFERENCES repositories(id)
-    );
-    
-    -- Commit audit log table
     CREATE TABLE IF NOT EXISTS commit_audit (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       repository_id INTEGER,
@@ -152,10 +121,8 @@ function initializeDatabase() {
       FOREIGN KEY (repository_id) REFERENCES repositories(id)
     );
     
-    -- Create indexes
     CREATE INDEX IF NOT EXISTS idx_sync_history_repo ON sync_history(repository_id);
     CREATE INDEX IF NOT EXISTS idx_sync_history_status ON sync_history(status);
-    CREATE INDEX IF NOT EXISTS idx_pending_approvals_status ON pending_approvals(status);
     CREATE INDEX IF NOT EXISTS idx_repositories_gitlab_id ON repositories(gitlab_id);
     CREATE INDEX IF NOT EXISTS idx_commit_audit_repo ON commit_audit(repository_id);
     CREATE INDEX IF NOT EXISTS idx_commit_audit_branch ON commit_audit(branch);
@@ -166,49 +133,38 @@ function initializeDatabase() {
   return db;
 }
 
-const db = initializeDatabase();
-
 // ============================================================================
-// GITLAB API CLIENTS
+// GITLAB CLIENT INITIALIZATION
 // ============================================================================
 let sourceGitlab, targetGitlab;
 
 function initializeGitlabClients() {
-  if (!CONFIG.source.url || !CONFIG.source.token) {
-    console.error('❌ Source GitLab configuration missing');
-    return false;
-  }
-  
-  if (!CONFIG.target.url || !CONFIG.target.token) {
-    console.error('❌ Target GitLab configuration missing');
-    return false;
-  }
-  
   try {
+    if (!CONFIG.source.url || !CONFIG.source.token) {
+      console.warn('⚠️ Source GitLab not configured');
+      return false;
+    }
+    
+    if (!CONFIG.target.url || !CONFIG.target.token) {
+      console.warn('⚠️ Target GitLab not configured');
+      return false;
+    }
+    
     sourceGitlab = new Gitlab({
       host: CONFIG.source.url,
-      token: CONFIG.source.token
+      token: CONFIG.source.token,
+      rejectUnauthorized: false
     });
     
     targetGitlab = new Gitlab({
       host: CONFIG.target.url,
-      token: CONFIG.target.token
+      token: CONFIG.target.token,
+      rejectUnauthorized: false
     });
     
     console.log('✅ GitLab clients initialized');
-    
-    // Log group configuration
-    if (CONFIG.source.groupId) {
-      console.log(`   Source: Group ${CONFIG.source.groupId}`);
-    } else {
-      console.log(`   Source: All accessible projects`);
-    }
-    
-    if (CONFIG.target.groupId) {
-      console.log(`   Target: Group ${CONFIG.target.groupId}`);
-    } else {
-      console.log(`   Target: User namespace`);
-    }
+    console.log(`   Source: ${CONFIG.source.groupId || 'All accessible projects'}`);
+    console.log(`   Target: ${CONFIG.target.groupId || 'Preserve source namespaces'}`);
     
     return true;
   } catch (error) {
@@ -218,39 +174,7 @@ function initializeGitlabClients() {
 }
 
 // ============================================================================
-// UTILITY FUNCTIONS
-// ============================================================================
-
-// Sanitize repository name for safe file system operations
-function sanitizeRepoName(name) {
-  return name.replace(/[^a-zA-Z0-9-_]/g, '_');
-}
-
-// Verify webhook signature
-function verifyWebhookSignature(payload, receivedToken) {
-  if (!CONFIG.webhookSecret) {
-    console.warn('⚠️ No webhook secret configured, skipping verification');
-    return true; // Allow if no secret configured
-  }
-  
-  if (!receivedToken) {
-    console.warn('⚠️ No token received in webhook');
-    return false;
-  }
-  
-  // GitLab sends the secret token directly in X-Gitlab-Token header
-  // Simple comparison (GitLab doesn't use HMAC by default)
-  return receivedToken === CONFIG.webhookSecret;
-}
-
-// Emit event to all connected clients
-function emitToClients(event, data) {
-  io.emit(event, data);
-  console.log(`📡 Emitted ${event}:`, data);
-}
-
-// ============================================================================
-// DATABASE OPERATIONS (Parameterized queries for SQL injection prevention)
+// DATABASE HELPER FUNCTIONS
 // ============================================================================
 
 function getRepositories() {
@@ -324,21 +248,21 @@ function upsertRepository(repo) {
 function createSyncHistory(repositoryId, status) {
   const stmt = db.prepare(`
     INSERT INTO sync_history (repository_id, status, started_at)
-    VALUES (?, ?, CURRENT_TIMESTAMP)
+    VALUES (?, ?, ?)
   `);
   
-  const result = stmt.run(repositoryId, status);
+  const result = stmt.run(repositoryId, status, new Date().toISOString());
   return result.lastInsertRowid;
 }
 
-function updateSyncHistory(syncId, status, error = null, commitCount = 0) {
+function updateSyncHistory(syncId, status, errorMessage = null, commitCount = 0) {
   const stmt = db.prepare(`
     UPDATE sync_history 
-    SET status = ?, completed_at = CURRENT_TIMESTAMP, error_message = ?, commits_synced = ?
+    SET status = ?, completed_at = ?, error_message = ?, commits_synced = ?
     WHERE id = ?
   `);
   
-  stmt.run(status, error, commitCount, syncId);
+  stmt.run(status, new Date().toISOString(), errorMessage, commitCount, syncId);
 }
 
 function getSyncHistory(limit = 50) {
@@ -351,55 +275,6 @@ function getSyncHistory(limit = 50) {
   `);
   
   return stmt.all(limit);
-}
-
-async function findOrCreateTargetNamespace(sourceNamespacePath) {
-  try {
-    // sourceNamespacePath is like "engineering/subgroup" or just "engineering"
-    // We need to find the matching namespace on target
-    
-    console.log(`  🔍 Looking for namespace: ${sourceNamespacePath}`);
-    
-    // Try to find existing group by path
-    const groups = await targetGitlab.Groups.all({
-      search: sourceNamespacePath,
-      perPage: 100
-    });
-    
-    // Look for exact path match
-    let targetGroup = groups.find(g => g.full_path === sourceNamespacePath);
-    
-    if (targetGroup) {
-      console.log(`  ✅ Found existing namespace: ${targetGroup.full_path} (ID: ${targetGroup.id})`);
-      return targetGroup.id;
-    }
-    
-    // If not found, try to create it
-    // For nested groups like "engineering/backend", we need to handle parent groups
-    const pathParts = sourceNamespacePath.split('/');
-    
-    if (pathParts.length > 1) {
-      // Nested group - not implementing auto-creation of nested groups for safety
-      console.warn(`  ⚠️ Nested group ${sourceNamespacePath} not found on target`);
-      console.warn(`  ⚠️ Please create this group manually on target GitLab`);
-      return null;
-    }
-    
-    // Try to create single-level group
-    console.log(`  ➕ Creating group: ${sourceNamespacePath}`);
-    const newGroup = await targetGitlab.Groups.create({
-      name: pathParts[0],
-      path: pathParts[0],
-      visibility: 'private'
-    });
-    
-    console.log(`  ✅ Created group: ${newGroup.full_path} (ID: ${newGroup.id})`);
-    return newGroup.id;
-    
-  } catch (error) {
-    console.error(`  ❌ Error finding/creating namespace ${sourceNamespacePath}:`, error.message);
-    return null;
-  }
 }
 
 function logCommitsToAudit(repositoryId, repositoryName, commits) {
@@ -430,31 +305,7 @@ function logCommitsToAudit(repositoryId, repositoryName, commits) {
   }
 }
 
-// Cleanup old audit logs to prevent database bloat
 function cleanupOldAuditLogs(retentionDays = 90) {
-  try {
-    const cutoffDate = new Date();
-    cutoffDate.setDate(cutoffDate.setDate() - retentionDays);
-    
-    const stmt = db.prepare(`
-      DELETE FROM commit_audit 
-      WHERE timestamp < ?
-    `);
-    
-    const result = stmt.run(cutoffDate.toISOString());
-    
-    if (result.changes > 0) {
-      console.log(`🗑️ Cleaned up ${result.changes} audit log entries older than ${retentionDays} days`);
-    }
-    
-    return result.changes;
-  } catch (error) {
-    console.error('❌ Error cleaning up audit logs:', error.message);
-    return 0;
-  }
-}
-
-function cleanupOldAuditLogs(retentionDays = 30) {
   try {
     const cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() - retentionDays);
@@ -478,33 +329,34 @@ function cleanupOldAuditLogs(retentionDays = 30) {
 }
 
 // ============================================================================
-// SYNC OPERATIONS
+// GITLAB OPERATIONS
 // ============================================================================
 
 async function fetchSourceRepositories() {
   try {
+    console.log('🔍 Fetching repositories from source GitLab...');
+    
     let projects;
     
     if (CONFIG.source.groupId) {
-      // Fetch projects from specific group
-      console.log(`🔍 Fetching repositories from source group ${CONFIG.source.groupId}...`);
+      // Fetch from specific group
       projects = await sourceGitlab.GroupProjects.all(CONFIG.source.groupId, {
+        includeSubgroups: true,
         perPage: 100,
-        includeSubgroups: true
+        archived: false
       });
+      console.log(`✅ Found ${projects.length} repositories in group ${CONFIG.source.groupId}`);
     } else {
-      // Fetch all projects accessible to the user
-      console.log(`🔍 Fetching all accessible repositories from source...`);
+      // Fetch all accessible projects
       projects = await sourceGitlab.Projects.all({
-        perPage: 100,
-        membership: true,  // Only projects user is a member of
-        archived: false    // Exclude archived projects
+        membership: true,
+        archived: false,
+        perPage: 100
       });
+      console.log(`✅ Found ${projects.length} accessible repositories`);
     }
     
-    console.log(`✅ Found ${projects.length} repositories in source`);
-    
-    // Update database
+    // Upsert to database
     for (const project of projects) {
       upsertRepository(project);
     }
@@ -517,6 +369,66 @@ async function fetchSourceRepositories() {
     throw error;
   }
 }
+
+async function findOrCreateTargetNamespace(sourceNamespacePath) {
+  try {
+    console.log(`  🔍 Looking for namespace: ${sourceNamespacePath}`);
+    
+    const groups = await targetGitlab.Groups.all({
+      search: sourceNamespacePath,
+      perPage: 100
+    });
+    
+    // Look for exact path match
+    let targetGroup = groups.find(g => g.full_path === sourceNamespacePath);
+    
+    if (targetGroup) {
+      console.log(`  ✅ Found existing namespace: ${targetGroup.full_path} (ID: ${targetGroup.id})`);
+      return targetGroup.id;
+    }
+    
+    // For nested groups, try to match base group
+    const pathParts = sourceNamespacePath.split('/');
+    const baseGroup = pathParts[0];
+    
+    targetGroup = groups.find(g => g.path === baseGroup || g.full_path === baseGroup);
+    
+    if (targetGroup) {
+      console.log(`  ✅ Found base namespace: ${targetGroup.full_path} (ID: ${targetGroup.id})`);
+      if (pathParts.length > 1) {
+        console.warn(`  ⚠️ Source uses nested group "${sourceNamespacePath}" but only found "${targetGroup.full_path}"`);
+        console.warn(`  ⚠️ Repo will be created in base group: ${targetGroup.full_path}`);
+      }
+      return targetGroup.id;
+    }
+    
+    // Group not found - try to create it (single level only)
+    if (pathParts.length > 1) {
+      console.error(`  ❌ Nested group "${sourceNamespacePath}" not found on target`);
+      console.error(`  ❌ Please create this group manually on target GitLab`);
+      return null;
+    }
+    
+    // Create single-level group
+    console.log(`  ➕ Creating group: ${baseGroup}`);
+    const newGroup = await targetGitlab.Groups.create({
+      name: baseGroup,
+      path: baseGroup,
+      visibility: 'private'
+    });
+    
+    console.log(`  ✅ Created group: ${newGroup.full_path} (ID: ${newGroup.id})`);
+    return newGroup.id;
+    
+  } catch (error) {
+    console.error(`  ❌ Error finding/creating namespace ${sourceNamespacePath}:`, error.message);
+    return null;
+  }
+}
+
+// ============================================================================
+// REPOSITORY SYNC FUNCTION
+// ============================================================================
 
 async function syncRepository(repoId) {
   const repo = db.prepare('SELECT * FROM repositories WHERE id = ?').get(repoId);
@@ -533,7 +445,7 @@ async function syncRepository(repoId) {
     syncId
   });
   
-  // Use temporary directory for clone (ephemeral pod storage, auto-cleanup)
+  // Use temporary directory for clone (ephemeral pod storage)
   const tempId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
   const localPath = path.join('/tmp', `mirror-${tempId}`);
   
@@ -557,99 +469,62 @@ async function syncRepository(repoId) {
     
     console.log(`  ✅ Clone completed`);
     
-    // Get target repository or create it
-    let targetRepo;
-    try {
-      // Extract namespace from source repo path
-      // repo.path is like "engineering/backend-api" or "devops/infrastructure"
-      const pathParts = repo.path.split('/');
-      const repoName = pathParts[pathParts.length - 1]; // Last part is repo name
-      const namespacePath = pathParts.slice(0, -1).join('/'); // Everything before is namespace
+    // Get or create target repository
+    const pathParts = repo.path.split('/');
+    const repoName = pathParts[pathParts.length - 1];
+    const namespacePath = pathParts.slice(0, -1).join('/');
+    
+    console.log(`  📂 Source namespace: ${namespacePath || '(root)'}`);
+    
+    // Determine target namespace
+    let targetNamespaceId = null;
+    
+    if (CONFIG.target.groupId) {
+      targetNamespaceId = CONFIG.target.groupId;
+      console.log(`  📂 Using configured target group ID: ${targetNamespaceId}`);
+    } else if (namespacePath) {
+      targetNamespaceId = await findOrCreateTargetNamespace(namespacePath);
       
-      console.log(`  📂 Source namespace: ${namespacePath || '(root)'}`);
-      
-      // Determine target namespace
-      let targetNamespaceId = null;
-      
-      if (CONFIG.target.groupId) {
-        // If target group ID specified, always use that (single target group mode)
-        targetNamespaceId = CONFIG.target.groupId;
-        console.log(`  📂 Using configured target group ID: ${targetNamespaceId}`);
-      } else if (namespacePath) {
-        // Try to preserve the source namespace structure
-        console.log(`  🔍 Looking for matching namespace: ${namespacePath}`);
-        targetNamespaceId = await findOrCreateTargetNamespace(namespacePath);
-        
-        if (!targetNamespaceId) {
-          console.error(`  ❌ Could not find/create namespace "${namespacePath}" on target`);
-          console.error(`  ❌ Repo will NOT be synced to prevent wrong namespace creation`);
-          console.error(`  ❌ ACTION REQUIRED: Create group "${namespacePath}" on target GitLab first`);
-          console.error(`  ❌ OR set TARGET_GROUP_ID to use a single mirror group`);
-          throw new Error(`Namespace "${namespacePath}" not found on target. Create it first or set TARGET_GROUP_ID.`);
-        }
-      } else {
-        console.error(`  ❌ No namespace path and no TARGET_GROUP_ID configured`);
-        console.error(`  ❌ Would create in personal namespace (not allowed for corporate use)`);
-        throw new Error(`Cannot determine target namespace. Set TARGET_GROUP_ID or ensure groups exist on target.`);
+      if (!targetNamespaceId) {
+        throw new Error(`Namespace "${namespacePath}" not found on target and could not be created`);
       }
-      
-      // Try to find existing project
-      if (targetNamespaceId) {
-        const targetProjects = await targetGitlab.GroupProjects.all(targetNamespaceId);
-        targetRepo = targetProjects.find(p => p.path === repoName);
-      } else {
-        // Search in user namespace
-        const targetProjects = await targetGitlab.Projects.all({
-          perPage: 100,
-          membership: true,
-          search: repo.name
-        });
-        targetRepo = targetProjects.find(p => p.path === repoName);
-      }
-      
-      if (!targetRepo) {
-        console.log(`  ➕ Creating target repository ${repo.name}...`);
-        const createParams = {
-          name: repo.name,
-          path: repoName,
-          description: repo.description,
-          visibility: 'private'
-        };
-        
-        // Add namespace if we found/created one
-        if (targetNamespaceId) {
-          createParams.namespaceId = targetNamespaceId;
-          console.log(`  📂 Creating in namespace ID: ${targetNamespaceId}`);
-        } else {
-          console.log(`  📂 Creating in user namespace`);
-        }
-        
-        targetRepo = await targetGitlab.Projects.create(createParams);
-      }
-    } catch (error) {
-      console.error('  ❌ Error finding/creating target repo:', error.message);
-      throw error;
+    } else {
+      throw new Error(`Cannot determine target namespace. Set TARGET_GROUP_ID or ensure groups exist on target.`);
     }
     
-    // Push to target using http URL with token embedded (safer than shell commands)
+    // Try to find existing project
+    let targetRepo;
+    const targetProjects = await targetGitlab.GroupProjects.all(targetNamespaceId);
+    targetRepo = targetProjects.find(p => p.path === repoName);
+    
+    if (!targetRepo) {
+      console.log(`  ➕ Creating target repository ${repo.name}...`);
+      targetRepo = await targetGitlab.Projects.create({
+        name: repo.name,
+        path: repoName,
+        description: repo.description,
+        visibility: 'private',
+        namespaceId: targetNamespaceId
+      });
+      console.log(`  ✅ Created target repository`);
+    }
+    
+    // Push to target
     console.log(`  📤 Pushing to target...`);
     const repoGit = simpleGit(localPath);
     
-    // Construct authenticated target URL safely
+    // Construct authenticated target URL
     const targetUrl = new URL(targetRepo.http_url_to_repo);
     targetUrl.username = 'oauth2';
     targetUrl.password = CONFIG.target.token;
     
-    // Handle protected branches: unprotect, mirror, then re-protect
+    // Handle protected branches
     let protectedBranches = [];
     try {
-      // Get list of protected branches
       protectedBranches = await targetGitlab.ProtectedBranches.all(targetRepo.id);
       
       if (protectedBranches.length > 0) {
         console.log(`  🔓 Unprotecting ${protectedBranches.length} branches...`);
-        
-        // Unprotect all branches temporarily
         for (const branch of protectedBranches) {
           await targetGitlab.ProtectedBranches.unprotect(targetRepo.id, branch.name);
         }
@@ -658,34 +533,22 @@ async function syncRepository(repoId) {
       console.warn(`  ⚠️ Could not check/unprotect branches: ${error.message}`);
     }
     
-    // Push with mirror
-    // Note: GitLab has hidden refs that can't be pushed (deployments, merge-requests)
-    // We need to push all branches and tags, but skip these hidden refs
-    console.log(`  📤 Pushing branches and tags to target...`);
-    
+    // Push branches and tags (NOT --mirror to avoid hidden refs)
     try {
-      // Push all branches
       await repoGit.push(targetUrl.toString(), '--all');
       console.log(`  ✅ Branches pushed`);
       
-      // Push all tags
       await repoGit.push(targetUrl.toString(), '--tags');
       console.log(`  ✅ Tags pushed`);
     } catch (pushError) {
-      // If push fails, log but don't fail the sync entirely
-      // Some refs might be rejected but the main content is pushed
       console.warn(`  ⚠️ Push warning: ${pushError.message}`);
     }
     
     console.log(`  ✅ Mirror push completed`);
     
-    // Note: Audit log is populated via webhooks, not from git log extraction
-    // This keeps sync fast and storage minimal
-    
-    // Re-protect branches that were protected
+    // Re-protect branches
     if (protectedBranches.length > 0) {
       console.log(`  🔒 Re-protecting ${protectedBranches.length} branches...`);
-      
       for (const branch of protectedBranches) {
         try {
           await targetGitlab.ProtectedBranches.protect(targetRepo.id, branch.name, {
@@ -699,14 +562,10 @@ async function syncRepository(repoId) {
       }
     }
     
-    // Success - update sync history
-    // Note: commitCount is 0 since we're not extracting from git log
-    // Actual commit tracking happens via webhooks
-    const commitCount = 0;
-    
+    const commitCount = 0; // Note: Audit via webhooks, not git log
     updateSyncHistory(syncId, 'success', null, commitCount);
     
-    // Clear the "new commits" flag since we just synced
+    // Clear the "new commits" flag
     db.prepare('UPDATE repositories SET has_new_commits = 0 WHERE id = ?').run(repoId);
     
     console.log(`✅ Successfully synced ${repo.name}`);
@@ -719,7 +578,7 @@ async function syncRepository(repoId) {
       commitCount
     });
     
-    // Cleanup: Delete temporary clone
+    // Cleanup temporary clone
     console.log(`  🗑️ Cleaning up temporary clone...`);
     if (fs.existsSync(localPath)) {
       fs.rmSync(localPath, { recursive: true, force: true });
@@ -741,7 +600,7 @@ async function syncRepository(repoId) {
       error: error.message
     });
     
-    // Cleanup: Delete temporary clone even on error
+    // Cleanup temporary clone even on error
     try {
       if (fs.existsSync(localPath)) {
         fs.rmSync(localPath, { recursive: true, force: true });
@@ -762,8 +621,7 @@ async function syncAllRepositories() {
   const results = {
     total: repos.length,
     success: 0,
-    failed: 0,
-    errors: []
+    failed: 0
   };
   
   for (const repo of repos) {
@@ -771,15 +629,12 @@ async function syncAllRepositories() {
       await syncRepository(repo.id);
       results.success++;
     } catch (error) {
+      console.error(`Failed to sync ${repo.name}:`, error.message);
       results.failed++;
-      results.errors.push({
-        repository: repo.name,
-        error: error.message
-      });
     }
   }
   
-  console.log(`✅ Sync completed: ${results.success} success, ${results.failed} failed`);
+  console.log(`✅ Sync all completed: ${results.success} success, ${results.failed} failed`);
   
   emitToClients('sync_all_completed', results);
   
@@ -787,20 +642,33 @@ async function syncAllRepositories() {
 }
 
 // ============================================================================
-// REST API ENDPOINTS
+// WEBHOOK HANDLING
 // ============================================================================
 
-// Health check
-app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'healthy',
-    timestamp: new Date().toISOString(),
-    database: db ? 'connected' : 'disconnected',
-    gitlab: sourceGitlab && targetGitlab ? 'connected' : 'disconnected'
-  });
-});
+function verifyWebhookSignature(payload, receivedToken) {
+  if (!CONFIG.webhookSecret) {
+    console.warn('⚠️ No webhook secret configured, skipping verification');
+    return true;
+  }
+  
+  if (!receivedToken) {
+    console.warn('⚠️ No token received in webhook');
+    return false;
+  }
+  
+  return receivedToken === CONFIG.webhookSecret;
+}
 
-// Get configuration
+function emitToClients(event, data) {
+  io.emit(event, data);
+  console.log(`📡 Emitted ${event}:`, data);
+}
+
+// ============================================================================
+// API ROUTES
+// ============================================================================
+
+// Configuration
 app.get('/api/config', (req, res) => {
   res.json({
     source: {
@@ -811,11 +679,11 @@ app.get('/api/config', (req, res) => {
       url: CONFIG.target.url,
       groupId: CONFIG.target.groupId
     },
-    syncSchedule: CONFIG.syncSchedule
+    syncSchedule: '0 2 * * *'
   });
 });
 
-// Get all repositories
+// Get repositories
 app.get('/api/repositories', (req, res) => {
   try {
     const repos = getRepositories();
@@ -826,7 +694,7 @@ app.get('/api/repositories', (req, res) => {
   }
 });
 
-// Refresh repository list from source
+// Refresh repository list
 app.post('/api/repositories/refresh', async (req, res) => {
   try {
     const projects = await fetchSourceRepositories();
@@ -852,7 +720,6 @@ app.post('/api/sync/:repoId', async (req, res) => {
 // Sync all repositories
 app.post('/api/sync/all', async (req, res) => {
   try {
-    // Start sync in background
     syncAllRepositories().catch(err => {
       console.error('Background sync error:', err);
     });
@@ -903,7 +770,7 @@ app.get('/api/audit/commits', (req, res) => {
   }
 });
 
-// Webhook endpoint - Process GitLab push events for real-time monitoring
+// Webhook endpoint
 app.post('/api/webhook', (req, res) => {
   const signature = req.headers['x-gitlab-token'];
   
@@ -913,14 +780,20 @@ app.post('/api/webhook', (req, res) => {
   }
   
   const event = req.headers['x-gitlab-event'];
-  console.log(`📨 Received webhook: ${event}`);
+  const payload = req.body;
   
-  // Handle Push events for commit monitoring
-  if (event === 'Push Hook') {
+  console.log(`📨 Received webhook: ${event} (${payload.object_kind || payload.event_name})`);
+  
+  // Handle Push events from System Hooks or Project Hooks
+  const isPushEvent = 
+    payload.object_kind === 'push' || 
+    payload.event_name === 'push' ||
+    event === 'Push Hook';
+  
+  if (isPushEvent) {
     try {
-      const payload = req.body;
       const projectName = payload.project?.name || 'Unknown';
-      const projectId = payload.project?.id;
+      const projectId = payload.project?.id || payload.project_id;
       const ref = payload.ref || '';
       const branch = ref.replace('refs/heads/', '');
       const isForce = payload.total_commits_count === 0 && payload.commits?.length === 0;
@@ -933,11 +806,10 @@ app.post('/api/webhook', (req, res) => {
         const repo = db.prepare('SELECT id FROM repositories WHERE gitlab_id = ?').get(projectId);
         repoId = repo?.id;
         
-        // Mark repository as having new commits (needs sync)
+        // Mark repository as having new commits
         if (repoId) {
           db.prepare('UPDATE repositories SET has_new_commits = 1 WHERE id = ?').run(repoId);
           
-          // Notify UI to refresh repository list
           emitToClients('repositories_updated', {
             repositoryId: repoId,
             hasNewCommits: true
@@ -961,7 +833,6 @@ app.post('/api/webhook', (req, res) => {
         logCommitsToAudit(repoId, projectName, commitData);
         console.log(`  ✅ Logged ${commitData.length} commits to audit`);
         
-        // Emit to connected clients for real-time update
         emitToClients('audit_updated', {
           repository: projectName,
           branch: branch,
@@ -969,7 +840,6 @@ app.post('/api/webhook', (req, res) => {
           isForce: isForce
         });
       } else if (isForce) {
-        // Force push with no commits shown (rewrites history)
         console.log(`  ⚠️ Force push detected on ${branch}`);
         
         const forcePushData = [{
@@ -998,7 +868,6 @@ app.post('/api/webhook', (req, res) => {
     }
   }
   
-  // Legacy webhook event notification
   emitToClients('webhook_received', {
     event,
     timestamp: new Date().toISOString()
@@ -1007,7 +876,7 @@ app.post('/api/webhook', (req, res) => {
   res.json({ success: true });
 });
 
-// Serve frontend for all other routes
+// Serve frontend
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, '../frontend/build', 'index.html'));
 });
@@ -1024,22 +893,22 @@ io.on('connection', (socket) => {
 });
 
 // ============================================================================
-// SCHEDULED SYNC
+// SCHEDULER SETUP
 // ============================================================================
 let syncTask = null;
 
 function startScheduledSync() {
-  // Allow disabling scheduled sync via environment variable
-  if (process.env.DISABLE_SCHEDULED_SYNC === 'true') {
+  if (CONFIG.disableScheduledSync) {
     console.log('⏰ Scheduled sync is DISABLED (DISABLE_SCHEDULED_SYNC=true)');
   } else {
     if (syncTask) {
       syncTask.stop();
     }
     
-    console.log(`⏰ Scheduling sync: ${CONFIG.syncSchedule}`);
+    const schedule = '0 2 * * *'; // 2 AM daily
+    console.log(`⏰ Scheduling sync: ${schedule}`);
     
-    syncTask = cron.schedule(CONFIG.syncSchedule, async () => {
+    syncTask = cron.schedule(schedule, async () => {
       console.log('⏰ Running scheduled sync...');
       try {
         await syncAllRepositories();
@@ -1049,13 +918,12 @@ function startScheduledSync() {
     });
   }
   
-  // Schedule daily audit log cleanup (runs at 3 AM)
-  const retentionDays = parseInt(process.env.AUDIT_RETENTION_DAYS) || 90;
-  console.log(`🗑️ Scheduling daily audit log cleanup (retention: ${retentionDays} days, runs at 3 AM)`);
+  // Schedule daily audit log cleanup (3 AM)
+  console.log(`🗑️ Scheduling daily audit log cleanup (retention: ${CONFIG.auditRetentionDays} days, runs at 3 AM)`);
   
   cron.schedule('0 3 * * *', () => {
     console.log('🗑️ Running scheduled audit log cleanup...');
-    cleanupOldAuditLogs(retentionDays);
+    cleanupOldAuditLogs(CONFIG.auditRetentionDays);
   });
 }
 
@@ -1064,9 +932,8 @@ function startScheduledSync() {
 // ============================================================================
 async function startServer() {
   try {
-    // Git SSL configuration is handled via GIT_SSL_NO_VERIFY environment variable
-    // Set in Dockerfile, no need to write config file
-    console.log('🔧 Git configured to trust self-signed certificates (via GIT_SSL_NO_VERIFY)');
+    // Initialize database
+    initializeDatabase();
     
     // Initialize GitLab clients
     const gitlabReady = initializeGitlabClients();
@@ -1086,21 +953,17 @@ async function startServer() {
       console.log(`
 ╔════════════════════════════════════════════════════════════════╗
 ║                                                                ║
-║          🚀 GitLab Sync Monitor - Phase 1 (Secure)            ║
+║  🚀 GitLab Sync Monitor - Combined Version                    ║
 ║                                                                ║
-║  Server running on port ${CONFIG.port}                               ║
-║  Environment: ${process.env.NODE_ENV || 'development'}                                ║
-║  Database: ${CONFIG.dbPath}                           ║
-║  Sync Schedule: ${CONFIG.syncSchedule}                           ║
+║  📡 Server running on port ${CONFIG.port}                              ║
+║  💾 Database: ${CONFIG.dbPath}                    ║
+║  🔐 Webhook secret: ${CONFIG.webhookSecret ? 'Configured' : 'NOT CONFIGURED'}                        ║
+║  🔧 Git SSL verification: DISABLED (self-signed certs)        ║
+║  📦 Storage: Temporary /tmp/ (ephemeral)                      ║
+║  🗑️  Audit retention: ${CONFIG.auditRetentionDays} days                                ║
 ║                                                                ║
 ╚════════════════════════════════════════════════════════════════╝
       `);
-      
-      console.log('\n📋 Configuration Status:');
-      console.log(`  Source GitLab: ${CONFIG.source.url ? '✅' : '❌'}`);
-      console.log(`  Target GitLab: ${CONFIG.target.url ? '✅' : '❌'}`);
-      console.log(`  Webhook Secret: ${CONFIG.webhookSecret ? '✅' : '❌'}`);
-      console.log(`  JWT Secret: ${CONFIG.jwtSecret ? '✅' : '❌'}\n`);
     });
     
   } catch (error) {
@@ -1109,23 +972,25 @@ async function startServer() {
   }
 }
 
-// ============================================================================
-// GRACEFUL SHUTDOWN
-// ============================================================================
+// Start the server
+startServer();
+
+// Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('📴 SIGTERM received. Shutting down gracefully...');
+  console.log('SIGTERM received, shutting down gracefully');
   
   if (syncTask) {
     syncTask.stop();
   }
   
-  db.close();
+  if (db) {
+    db.close();
+  }
   
   server.close(() => {
-    console.log('✅ Server closed');
+    console.log('Server closed');
     process.exit(0);
   });
 });
 
-// Start the server
-startServer();
+module.exports = { app, server, io };
