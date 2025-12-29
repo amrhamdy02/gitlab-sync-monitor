@@ -577,13 +577,20 @@ async function syncRepository(repoId) {
         console.log(`  📂 Using configured target group ID: ${targetNamespaceId}`);
       } else if (namespacePath) {
         // Try to preserve the source namespace structure
+        console.log(`  🔍 Looking for matching namespace: ${namespacePath}`);
         targetNamespaceId = await findOrCreateTargetNamespace(namespacePath);
         
         if (!targetNamespaceId) {
-          console.warn(`  ⚠️ Could not find/create namespace ${namespacePath} on target`);
-          console.warn(`  ⚠️ Repository will be created in your personal namespace`);
-          console.warn(`  ⚠️ To fix: Create group "${namespacePath}" on target GitLab first`);
+          console.error(`  ❌ Could not find/create namespace "${namespacePath}" on target`);
+          console.error(`  ❌ Repo will NOT be synced to prevent wrong namespace creation`);
+          console.error(`  ❌ ACTION REQUIRED: Create group "${namespacePath}" on target GitLab first`);
+          console.error(`  ❌ OR set TARGET_GROUP_ID to use a single mirror group`);
+          throw new Error(`Namespace "${namespacePath}" not found on target. Create it first or set TARGET_GROUP_ID.`);
         }
+      } else {
+        console.error(`  ❌ No namespace path and no TARGET_GROUP_ID configured`);
+        console.error(`  ❌ Would create in personal namespace (not allowed for corporate use)`);
+        throw new Error(`Cannot determine target namespace. Set TARGET_GROUP_ID or ensure groups exist on target.`);
       }
       
       // Try to find existing project
@@ -652,7 +659,23 @@ async function syncRepository(repoId) {
     }
     
     // Push with mirror
-    await repoGit.push(targetUrl.toString(), '--mirror');
+    // Note: GitLab has hidden refs that can't be pushed (deployments, merge-requests)
+    // We need to push all branches and tags, but skip these hidden refs
+    console.log(`  📤 Pushing branches and tags to target...`);
+    
+    try {
+      // Push all branches
+      await repoGit.push(targetUrl.toString(), '--all');
+      console.log(`  ✅ Branches pushed`);
+      
+      // Push all tags
+      await repoGit.push(targetUrl.toString(), '--tags');
+      console.log(`  ✅ Tags pushed`);
+    } catch (pushError) {
+      // If push fails, log but don't fail the sync entirely
+      // Some refs might be rejected but the main content is pushed
+      console.warn(`  ⚠️ Push warning: ${pushError.message}`);
+    }
     
     console.log(`  ✅ Mirror push completed`);
     
