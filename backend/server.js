@@ -353,6 +353,55 @@ function getSyncHistory(limit = 50) {
   return stmt.all(limit);
 }
 
+async function findOrCreateTargetNamespace(sourceNamespacePath) {
+  try {
+    // sourceNamespacePath is like "engineering/subgroup" or just "engineering"
+    // We need to find the matching namespace on target
+    
+    console.log(`  🔍 Looking for namespace: ${sourceNamespacePath}`);
+    
+    // Try to find existing group by path
+    const groups = await targetGitlab.Groups.all({
+      search: sourceNamespacePath,
+      perPage: 100
+    });
+    
+    // Look for exact path match
+    let targetGroup = groups.find(g => g.full_path === sourceNamespacePath);
+    
+    if (targetGroup) {
+      console.log(`  ✅ Found existing namespace: ${targetGroup.full_path} (ID: ${targetGroup.id})`);
+      return targetGroup.id;
+    }
+    
+    // If not found, try to create it
+    // For nested groups like "engineering/backend", we need to handle parent groups
+    const pathParts = sourceNamespacePath.split('/');
+    
+    if (pathParts.length > 1) {
+      // Nested group - not implementing auto-creation of nested groups for safety
+      console.warn(`  ⚠️ Nested group ${sourceNamespacePath} not found on target`);
+      console.warn(`  ⚠️ Please create this group manually on target GitLab`);
+      return null;
+    }
+    
+    // Try to create single-level group
+    console.log(`  ➕ Creating group: ${sourceNamespacePath}`);
+    const newGroup = await targetGitlab.Groups.create({
+      name: pathParts[0],
+      path: pathParts[0],
+      visibility: 'private'
+    });
+    
+    console.log(`  ✅ Created group: ${newGroup.full_path} (ID: ${newGroup.id})`);
+    return newGroup.id;
+    
+  } catch (error) {
+    console.error(`  ❌ Error finding/creating namespace ${sourceNamespacePath}:`, error.message);
+    return null;
+  }
+}
+
 function logCommitsToAudit(repositoryId, repositoryName, commits) {
   const stmt = db.prepare(`
     INSERT INTO commit_audit (
@@ -378,6 +427,53 @@ function logCommitsToAudit(repositoryId, repositoryName, commits) {
     } catch (error) {
       console.warn(`Failed to log commit ${commit.sha}:`, error.message);
     }
+  }
+}
+
+// Cleanup old audit logs to prevent database bloat
+function cleanupOldAuditLogs(retentionDays = 90) {
+  try {
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.setDate() - retentionDays);
+    
+    const stmt = db.prepare(`
+      DELETE FROM commit_audit 
+      WHERE timestamp < ?
+    `);
+    
+    const result = stmt.run(cutoffDate.toISOString());
+    
+    if (result.changes > 0) {
+      console.log(`🗑️ Cleaned up ${result.changes} audit log entries older than ${retentionDays} days`);
+    }
+    
+    return result.changes;
+  } catch (error) {
+    console.error('❌ Error cleaning up audit logs:', error.message);
+    return 0;
+  }
+}
+
+function cleanupOldAuditLogs(retentionDays = 30) {
+  try {
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - retentionDays);
+    
+    const stmt = db.prepare(`
+      DELETE FROM commit_audit 
+      WHERE timestamp < ?
+    `);
+    
+    const result = stmt.run(cutoffDate.toISOString());
+    
+    if (result.changes > 0) {
+      console.log(`🗑️ Cleaned up ${result.changes} audit log entries older than ${retentionDays} days`);
+    }
+    
+    return result.changes;
+  } catch (error) {
+    console.error('❌ Error cleaning up audit logs:', error.message);
+    return 0;
   }
 }
 
@@ -437,66 +533,88 @@ async function syncRepository(repoId) {
     syncId
   });
   
+  // Use temporary directory for clone (ephemeral pod storage, auto-cleanup)
+  const tempId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  const localPath = path.join('/tmp', `mirror-${tempId}`);
+  
   try {
     console.log(`🔄 Starting sync for ${repo.name}...`);
-    
-    // Sanitize repository name for local path
-    const localPath = path.join(CONFIG.reposPath, sanitizeRepoName(repo.path));
-    
-    // Ensure parent directory exists
-    const parentDir = path.dirname(localPath);
-    if (!fs.existsSync(parentDir)) {
-      fs.mkdirSync(parentDir, { recursive: true });
-    }
+    console.log(`  📁 Using temporary clone: ${localPath}`);
     
     const git = simpleGit();
     
-    // Clone or update local repository
-    if (!fs.existsSync(localPath)) {
-      console.log(`  📥 Cloning ${repo.name}...`);
-      
-      // Construct authenticated source URL
-      const sourceUrl = new URL(repo.http_url);
-      sourceUrl.username = 'oauth2';
-      sourceUrl.password = CONFIG.source.token;
-      
-      await git.clone(sourceUrl.toString(), localPath, {
-        '--mirror': null
-      });
-    } else {
-      console.log(`  🔃 Updating ${repo.name}...`);
-      const repoGit = simpleGit(localPath);
-      await repoGit.fetch(['--all', '--prune']);
-    }
+    // Clone repository to temporary location with mirror
+    console.log(`  📥 Cloning ${repo.name} to temporary location...`);
+    
+    // Construct authenticated source URL
+    const sourceUrl = new URL(repo.http_url);
+    sourceUrl.username = 'oauth2';
+    sourceUrl.password = CONFIG.source.token;
+    
+    await git.clone(sourceUrl.toString(), localPath, {
+      '--mirror': null
+    });
+    
+    console.log(`  ✅ Clone completed`);
     
     // Get target repository or create it
     let targetRepo;
     try {
+      // Extract namespace from source repo path
+      // repo.path is like "engineering/backend-api" or "devops/infrastructure"
+      const pathParts = repo.path.split('/');
+      const repoName = pathParts[pathParts.length - 1]; // Last part is repo name
+      const namespacePath = pathParts.slice(0, -1).join('/'); // Everything before is namespace
+      
+      console.log(`  📂 Source namespace: ${namespacePath || '(root)'}`);
+      
+      // Determine target namespace
+      let targetNamespaceId = null;
+      
       if (CONFIG.target.groupId) {
-        // Try to find existing project in specific group
-        const targetProjects = await targetGitlab.GroupProjects.all(CONFIG.target.groupId);
-        targetRepo = targetProjects.find(p => p.path === repo.path.split('/').pop());
+        // If target group ID specified, always use that (single target group mode)
+        targetNamespaceId = CONFIG.target.groupId;
+        console.log(`  📂 Using configured target group ID: ${targetNamespaceId}`);
+      } else if (namespacePath) {
+        // Try to preserve the source namespace structure
+        targetNamespaceId = await findOrCreateTargetNamespace(namespacePath);
+        
+        if (!targetNamespaceId) {
+          console.warn(`  ⚠️ Could not find/create namespace ${namespacePath} on target`);
+          console.warn(`  ⚠️ Repository will be created in your personal namespace`);
+          console.warn(`  ⚠️ To fix: Create group "${namespacePath}" on target GitLab first`);
+        }
+      }
+      
+      // Try to find existing project
+      if (targetNamespaceId) {
+        const targetProjects = await targetGitlab.GroupProjects.all(targetNamespaceId);
+        targetRepo = targetProjects.find(p => p.path === repoName);
       } else {
-        // Try to find existing project among all accessible projects
+        // Search in user namespace
         const targetProjects = await targetGitlab.Projects.all({
           perPage: 100,
           membership: true,
           search: repo.name
         });
-        targetRepo = targetProjects.find(p => p.path === repo.path.split('/').pop());
+        targetRepo = targetProjects.find(p => p.path === repoName);
       }
       
       if (!targetRepo) {
         console.log(`  ➕ Creating target repository ${repo.name}...`);
         const createParams = {
           name: repo.name,
+          path: repoName,
           description: repo.description,
           visibility: 'private'
         };
         
-        // Add namespace only if group ID is provided
-        if (CONFIG.target.groupId) {
-          createParams.namespaceId = CONFIG.target.groupId;
+        // Add namespace if we found/created one
+        if (targetNamespaceId) {
+          createParams.namespaceId = targetNamespaceId;
+          console.log(`  📂 Creating in namespace ID: ${targetNamespaceId}`);
+        } else {
+          console.log(`  📂 Creating in user namespace`);
         }
         
         targetRepo = await targetGitlab.Projects.create(createParams);
@@ -536,41 +654,10 @@ async function syncRepository(repoId) {
     // Push with mirror
     await repoGit.push(targetUrl.toString(), '--mirror');
     
-    // Extract and log commits for audit
-    try {
-      const branches = await repoGit.branch(['-r']);
-      const commitData = [];
-      
-      for (const branchName of Object.keys(branches.branches)) {
-        const cleanBranch = branchName.replace('origin/', '');
-        try {
-          const log = await repoGit.log({ [cleanBranch]: null, maxCount: 10 });
-          
-          for (const commit of log.all) {
-            commitData.push({
-              branch: cleanBranch,
-              sha: commit.hash,
-              message: commit.message,
-              author_name: commit.author_name,
-              author_email: commit.author_email,
-              timestamp: commit.date,
-              type: commit.message.toLowerCase().includes('merge') ? 'merge' : 'push',
-              is_force: false
-            });
-          }
-        } catch (branchError) {
-          // Branch might be empty or invalid, skip it
-          console.warn(`  ⚠️ Could not get log for branch ${cleanBranch}`);
-        }
-      }
-      
-      if (commitData.length > 0) {
-        logCommitsToAudit(repoId, repo.name, commitData);
-        console.log(`  📝 Logged ${commitData.length} commits to audit`);
-      }
-    } catch (auditError) {
-      console.warn(`  ⚠️ Could not log commits to audit: ${auditError.message}`);
-    }
+    console.log(`  ✅ Mirror push completed`);
+    
+    // Note: Audit log is populated via webhooks, not from git log extraction
+    // This keeps sync fast and storage minimal
     
     // Re-protect branches that were protected
     if (protectedBranches.length > 0) {
@@ -589,15 +676,17 @@ async function syncRepository(repoId) {
       }
     }
     
-    const log = await repoGit.log();
-    const commitCount = log.total || 0;
+    // Success - update sync history
+    // Note: commitCount is 0 since we're not extracting from git log
+    // Actual commit tracking happens via webhooks
+    const commitCount = 0;
     
     updateSyncHistory(syncId, 'success', null, commitCount);
     
     // Clear the "new commits" flag since we just synced
     db.prepare('UPDATE repositories SET has_new_commits = 0 WHERE id = ?').run(repoId);
     
-    console.log(`✅ Successfully synced ${repo.name} (${commitCount} commits)`);
+    console.log(`✅ Successfully synced ${repo.name}`);
     
     emitToClients('sync_completed', {
       repositoryId: repoId,
@@ -606,6 +695,13 @@ async function syncRepository(repoId) {
       status: 'success',
       commitCount
     });
+    
+    // Cleanup: Delete temporary clone
+    console.log(`  🗑️ Cleaning up temporary clone...`);
+    if (fs.existsSync(localPath)) {
+      fs.rmSync(localPath, { recursive: true, force: true });
+      console.log(`  ✅ Temporary clone deleted`);
+    }
     
     return { success: true, commitCount };
     
@@ -621,6 +717,16 @@ async function syncRepository(repoId) {
       status: 'failed',
       error: error.message
     });
+    
+    // Cleanup: Delete temporary clone even on error
+    try {
+      if (fs.existsSync(localPath)) {
+        fs.rmSync(localPath, { recursive: true, force: true });
+        console.log(`  🗑️ Cleaned up temporary clone after error`);
+      }
+    } catch (cleanupError) {
+      console.warn(`  ⚠️ Could not cleanup temporary clone: ${cleanupError.message}`);
+    }
     
     throw error;
   }
@@ -900,19 +1006,33 @@ io.on('connection', (socket) => {
 let syncTask = null;
 
 function startScheduledSync() {
-  if (syncTask) {
-    syncTask.stop();
+  // Allow disabling scheduled sync via environment variable
+  if (process.env.DISABLE_SCHEDULED_SYNC === 'true') {
+    console.log('⏰ Scheduled sync is DISABLED (DISABLE_SCHEDULED_SYNC=true)');
+  } else {
+    if (syncTask) {
+      syncTask.stop();
+    }
+    
+    console.log(`⏰ Scheduling sync: ${CONFIG.syncSchedule}`);
+    
+    syncTask = cron.schedule(CONFIG.syncSchedule, async () => {
+      console.log('⏰ Running scheduled sync...');
+      try {
+        await syncAllRepositories();
+      } catch (error) {
+        console.error('Scheduled sync error:', error);
+      }
+    });
   }
   
-  console.log(`⏰ Scheduling sync: ${CONFIG.syncSchedule}`);
+  // Schedule daily audit log cleanup (runs at 3 AM)
+  const retentionDays = parseInt(process.env.AUDIT_RETENTION_DAYS) || 90;
+  console.log(`🗑️ Scheduling daily audit log cleanup (retention: ${retentionDays} days, runs at 3 AM)`);
   
-  syncTask = cron.schedule(CONFIG.syncSchedule, async () => {
-    console.log('⏰ Running scheduled sync...');
-    try {
-      await syncAllRepositories();
-    } catch (error) {
-      console.error('Scheduled sync error:', error);
-    }
+  cron.schedule('0 3 * * *', () => {
+    console.log('🗑️ Running scheduled audit log cleanup...');
+    cleanupOldAuditLogs(retentionDays);
   });
 }
 
