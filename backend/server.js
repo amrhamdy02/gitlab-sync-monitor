@@ -340,7 +340,7 @@ async function fetchSourceRepositories() {
     
     if (CONFIG.source.groupId) {
       // Fetch from specific group
-      projects = await sourceGitlab.GroupProjects.all(CONFIG.source.groupId, {
+      projects = await sourceGitlab.Groups.allProjects(CONFIG.source.groupId, {
         includeSubgroups: true,
         perPage: 100,
         archived: false
@@ -494,7 +494,9 @@ async function syncRepository(repoId) {
     
     // Try to find existing project
     let targetRepo;
-    const targetProjects = await targetGitlab.GroupProjects.all(targetNamespaceId);
+    const targetProjects = await targetGitlab.Groups.allProjects(targetNamespaceId, {
+      perPage: 100
+    });
     targetRepo = targetProjects.find(p => p.path === repoName);
     
     if (!targetRepo) {
