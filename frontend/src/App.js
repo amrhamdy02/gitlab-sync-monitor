@@ -7,13 +7,42 @@ function App() {
   const [repositories, setRepositories] = useState([]);
   const [syncHistory, setSyncHistory] = useState([]);
   const [commitAudit, setCommitAudit] = useState([]);
-  const [activeTab, setActiveTab] = useState('repositories');
+  const [activeTab, setActiveTab] = useState('repositories'); // Changed default to repositories
   const [monitorTab, setMonitorTab] = useState('main');
   const [connected, setConnected] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [viewMode, setViewMode] = useState('grid');
   const [socket, setSocket] = useState(null);
   const [notification, setNotification] = useState(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [darkMode, setDarkMode] = useState(false);
+  
+  // Pagination states
+  const [currentPage, setCurrentPage] = useState(1);
+  const itemsPerPage = 50;
+
+  // Initialize dark mode from localStorage
+  useEffect(() => {
+    const savedTheme = localStorage.getItem('theme');
+    if (savedTheme === 'dark') {
+      setDarkMode(true);
+      document.documentElement.setAttribute('data-theme', 'dark');
+    }
+  }, []);
+
+  // Toggle dark mode
+  const toggleDarkMode = () => {
+    const newMode = !darkMode;
+    setDarkMode(newMode);
+    
+    if (newMode) {
+      document.documentElement.setAttribute('data-theme', 'dark');
+      localStorage.setItem('theme', 'dark');
+    } else {
+      document.documentElement.removeAttribute('data-theme');
+      localStorage.setItem('theme', 'light');
+    }
+  };
 
   // Initialize socket connection
   useEffect(() => {
@@ -92,7 +121,7 @@ function App() {
 
   const fetchCommitAudit = async () => {
     try {
-      const response = await fetch('/api/audit/commits?limit=100');
+      const response = await fetch('/api/audit/commits?limit=500'); // Fetch more for pagination
       const data = await response.json();
       setCommitAudit(data);
     } catch (error) {
@@ -142,12 +171,41 @@ function App() {
   );
 
   const mainBranchCommits = commitAudit.filter(c => 
-    ['main', 'master', 'develop'].includes(c.branch.toLowerCase())
+    ['main', 'master', 'develop'].includes(c.branch?.toLowerCase())
   );
   
   const otherBranchCommits = commitAudit.filter(c => 
-    !['main', 'master', 'develop'].includes(c.branch.toLowerCase())
+    !['main', 'master', 'develop'].includes(c.branch?.toLowerCase())
   );
+
+  // Pagination logic
+  const getCurrentPageData = (data) => {
+    const startIndex = (currentPage - 1) * itemsPerPage;
+    const endIndex = startIndex + itemsPerPage;
+    return data.slice(startIndex, endIndex);
+  };
+
+  const getTotalPages = (data) => {
+    return Math.ceil(data.length / itemsPerPage);
+  };
+
+  const handlePageChange = (page) => {
+    setCurrentPage(page);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const getCommitUrl = (commit) => {
+    if (!config) return '#';
+    
+    // Try to find the repository in our list
+    const repo = repositories.find(r => r.name === commit.repository);
+    if (repo && commit.sha) {
+      // Construct GitLab commit URL
+      const baseUrl = repo.web_url || config.source.url;
+      return `${baseUrl}/-/commit/${commit.sha}`;
+    }
+    return '#';
+  };
 
   const renderStatusBadge = (repo) => {
     if (repo.has_new_commits) {
@@ -190,6 +248,84 @@ function App() {
     return `${Math.floor(seconds / 86400)}d ago`;
   };
 
+  // Get last committer from audit log for a repository
+  const getLastCommitter = (repoName) => {
+    const repoCommits = commitAudit.filter(c => c.repository === repoName);
+    if (repoCommits.length > 0) {
+      return repoCommits[0].author_name;
+    }
+    return null;
+  };
+
+  const renderPagination = (totalItems) => {
+    const totalPages = getTotalPages(totalItems);
+    
+    if (totalPages <= 1) return null;
+
+    const pages = [];
+    const maxVisible = 7;
+    
+    if (totalPages <= maxVisible) {
+      for (let i = 1; i <= totalPages; i++) {
+        pages.push(i);
+      }
+    } else {
+      if (currentPage <= 4) {
+        for (let i = 1; i <= 5; i++) pages.push(i);
+        pages.push('...');
+        pages.push(totalPages);
+      } else if (currentPage >= totalPages - 3) {
+        pages.push(1);
+        pages.push('...');
+        for (let i = totalPages - 4; i <= totalPages; i++) pages.push(i);
+      } else {
+        pages.push(1);
+        pages.push('...');
+        for (let i = currentPage - 1; i <= currentPage + 1; i++) pages.push(i);
+        pages.push('...');
+        pages.push(totalPages);
+      }
+    }
+
+    return (
+      <div className="pagination">
+        <button
+          className="pagination-btn"
+          onClick={() => handlePageChange(currentPage - 1)}
+          disabled={currentPage === 1}
+        >
+          Previous
+        </button>
+        
+        {pages.map((page, index) => (
+          page === '...' ? (
+            <span key={`ellipsis-${index}`} className="pagination-info">...</span>
+          ) : (
+            <button
+              key={page}
+              className={`pagination-btn ${currentPage === page ? 'active' : ''}`}
+              onClick={() => handlePageChange(page)}
+            >
+              {page}
+            </button>
+          )
+        ))}
+        
+        <button
+          className="pagination-btn"
+          onClick={() => handlePageChange(currentPage + 1)}
+          disabled={currentPage === totalPages}
+        >
+          Next
+        </button>
+        
+        <span className="pagination-info">
+          {totalItems} total
+        </span>
+      </div>
+    );
+  };
+
   return (
     <div className="App">
       {/* Header */}
@@ -202,17 +338,27 @@ function App() {
           <div className="repo-count">
             {repositories.length} Repositories
           </div>
+          <div className="header-controls">
+            <button
+              className={`icon-btn ${darkMode ? 'active' : ''}`}
+              onClick={toggleDarkMode}
+              title={darkMode ? 'Light mode' : 'Dark mode'}
+            >
+              {darkMode ? '☀️' : '🌙'}
+            </button>
+            <button
+              className={`icon-btn ${showSettings ? 'active' : ''}`}
+              onClick={() => setShowSettings(!showSettings)}
+              title="Settings"
+            >
+              ⚙️
+            </button>
+          </div>
         </div>
       </header>
 
       {/* Navigation */}
       <nav className="app-nav">
-        <button
-          className={`nav-tab ${activeTab === 'config' ? 'active' : ''}`}
-          onClick={() => setActiveTab('config')}
-        >
-          Configuration
-        </button>
         <button
           className={`nav-tab ${activeTab === 'repositories' ? 'active' : ''}`}
           onClick={() => setActiveTab('repositories')}
@@ -221,7 +367,7 @@ function App() {
         </button>
         <button
           className={`nav-tab ${activeTab === 'monitor' ? 'active' : ''}`}
-          onClick={() => setActiveTab('monitor')}
+          onClick={() => { setActiveTab('monitor'); setCurrentPage(1); }}
         >
           Monitor
         </button>
@@ -235,55 +381,6 @@ function App() {
 
       {/* Main Content */}
       <main className="app-content">
-        {/* Configuration Tab */}
-        {activeTab === 'config' && config && (
-          <div className="config-section">
-            <div className="config-card">
-              <h3>Source GitLab</h3>
-              <div className="config-details">
-                <div className="config-item">
-                  <span className="config-label">URL</span>
-                  <span className="config-value">{config.source.url}</span>
-                </div>
-                <div className="config-item">
-                  <span className="config-label">Group ID</span>
-                  <span className="config-value">{config.source.groupId || 'All projects'}</span>
-                </div>
-              </div>
-            </div>
-
-            <div className="config-card">
-              <h3>Target GitLab</h3>
-              <div className="config-details">
-                <div className="config-item">
-                  <span className="config-label">URL</span>
-                  <span className="config-value">{config.target.url}</span>
-                </div>
-                <div className="config-item">
-                  <span className="config-label">Group ID</span>
-                  <span className="config-value">
-                    {config.target.groupId ? config.target.groupId : 'Preserve source structure'}
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            <div className="config-card">
-              <h3>Sync Schedule</h3>
-              <div className="config-details">
-                <div className="config-item">
-                  <span className="config-label">Schedule</span>
-                  <span className="config-value">{config.syncSchedule}</span>
-                </div>
-                <div className="config-item">
-                  <span className="config-label">Description</span>
-                  <span className="config-value">Daily at 2:00 AM</span>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-
         {/* Repositories Tab */}
         {activeTab === 'repositories' && (
           <>
@@ -335,39 +432,48 @@ function App() {
               </div>
             ) : (
               <div className={viewMode === 'grid' ? 'repositories-grid' : 'repositories-list'}>
-                {filteredRepositories.map((repo) => (
-                  <div key={repo.id} className="repo-card">
-                    <div className="repo-info">
-                      <div className="repo-details">
-                        <div className="repo-card-header">
-                          <div>
-                            <div className="repo-name">{repo.name}</div>
-                            <div className="repo-path">{repo.path}</div>
+                {filteredRepositories.map((repo) => {
+                  const lastCommitter = getLastCommitter(repo.name);
+                  
+                  return (
+                    <div key={repo.id} className="repo-card">
+                      <div className="repo-info">
+                        <div className="repo-details">
+                          <div className="repo-card-header">
+                            <div>
+                              <div className="repo-name">{repo.name}</div>
+                              <div className="repo-path">{repo.path}</div>
+                            </div>
+                            {renderStatusBadge(repo)}
                           </div>
-                          {renderStatusBadge(repo)}
-                        </div>
-                        {repo.description && (
-                          <div className="repo-description">{repo.description}</div>
-                        )}
-                        <div className="repo-meta">
-                          <span>Last activity: {formatTimeAgo(repo.last_activity)}</span>
-                          {repo.last_sync_time && (
-                            <span>Last sync: {formatTimeAgo(repo.last_sync_time)}</span>
+                          {repo.description && (
+                            <div className="repo-description">{repo.description}</div>
                           )}
+                          <div className="repo-meta">
+                            <span>Last activity: {formatTimeAgo(repo.last_activity)}</span>
+                            {repo.last_sync_time && (
+                              <span>Last sync: {formatTimeAgo(repo.last_sync_time)}</span>
+                            )}
+                            {lastCommitter && (
+                              <span className="last-committer">
+                                👤 {lastCommitter}
+                              </span>
+                            )}
+                          </div>
                         </div>
                       </div>
+                      <div className="repo-actions">
+                        <button
+                          className="btn btn-small btn-primary"
+                          onClick={() => handleSync(repo.id)}
+                          disabled={repo.last_sync_status === 'running'}
+                        >
+                          {repo.last_sync_status === 'running' ? 'Syncing...' : 'Sync Now'}
+                        </button>
+                      </div>
                     </div>
-                    <div className="repo-actions">
-                      <button
-                        className="btn btn-small btn-primary"
-                        onClick={() => handleSync(repo.id)}
-                        disabled={repo.last_sync_status === 'running'}
-                      >
-                        {repo.last_sync_status === 'running' ? 'Syncing...' : 'Sync Now'}
-                      </button>
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </>
@@ -379,15 +485,15 @@ function App() {
             <div className="monitor-tabs">
               <button
                 className={`monitor-tab ${monitorTab === 'main' ? 'active' : ''}`}
-                onClick={() => setMonitorTab('main')}
+                onClick={() => { setMonitorTab('main'); setCurrentPage(1); }}
               >
-                Main Branches
+                Main Branches ({mainBranchCommits.length})
               </button>
               <button
                 className={`monitor-tab ${monitorTab === 'other' ? 'active' : ''}`}
-                onClick={() => setMonitorTab('other')}
+                onClick={() => { setMonitorTab('other'); setCurrentPage(1); }}
               >
-                Other Branches
+                Other Branches ({otherBranchCommits.length})
               </button>
             </div>
 
@@ -405,14 +511,21 @@ function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {(monitorTab === 'main' ? mainBranchCommits : otherBranchCommits).length === 0 ? (
-                    <tr>
-                      <td colSpan="7" style={{ textAlign: 'center', padding: '3rem', color: 'var(--text-muted)' }}>
-                        No commits recorded yet
-                      </td>
-                    </tr>
-                  ) : (
-                    (monitorTab === 'main' ? mainBranchCommits : otherBranchCommits).map((commit, index) => (
+                  {(() => {
+                    const data = monitorTab === 'main' ? mainBranchCommits : otherBranchCommits;
+                    const pageData = getCurrentPageData(data);
+                    
+                    if (pageData.length === 0) {
+                      return (
+                        <tr>
+                          <td colSpan="7" style={{ textAlign: 'center', padding: '3rem', color: 'var(--text-muted)' }}>
+                            No commits recorded yet
+                          </td>
+                        </tr>
+                      );
+                    }
+                    
+                    return pageData.map((commit, index) => (
                       <tr key={index} className={commit.is_force ? 'force-push' : ''}>
                         <td><strong>{commit.repository}</strong></td>
                         <td><span className="branch-tag">{commit.branch}</span></td>
@@ -422,7 +535,16 @@ function App() {
                             <span className="author-email">{commit.author_email}</span>
                           </div>
                         </td>
-                        <td><code className="commit-sha">{commit.sha.substring(0, 8)}</code></td>
+                        <td>
+                          <a 
+                            href={getCommitUrl(commit)} 
+                            target="_blank" 
+                            rel="noopener noreferrer"
+                            className="commit-link"
+                          >
+                            <code className="commit-sha">{commit.sha?.substring(0, 8) || 'N/A'}</code>
+                          </a>
+                        </td>
                         <td><div className="commit-message">{commit.message}</div></td>
                         <td>
                           <span className={`commit-type-badge ${commit.type}`}>
@@ -431,11 +553,13 @@ function App() {
                         </td>
                         <td>{formatTimeAgo(commit.timestamp)}</td>
                       </tr>
-                    ))
-                  )}
+                    ));
+                  })()}
                 </tbody>
               </table>
             </div>
+
+            {renderPagination(monitorTab === 'main' ? mainBranchCommits : otherBranchCommits)}
           </>
         )}
 
@@ -471,6 +595,66 @@ function App() {
           </div>
         )}
       </main>
+
+      {/* Settings Modal */}
+      {showSettings && (
+        <div className="modal-overlay" onClick={() => setShowSettings(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Configuration</h2>
+              <button className="modal-close" onClick={() => setShowSettings(false)}>×</button>
+            </div>
+            
+            {config && (
+              <div className="config-section">
+                <div className="config-card">
+                  <h3>Source GitLab</h3>
+                  <div className="config-details">
+                    <div className="config-item">
+                      <span className="config-label">URL</span>
+                      <span className="config-value">{config.source.url}</span>
+                    </div>
+                    <div className="config-item">
+                      <span className="config-label">Group ID</span>
+                      <span className="config-value">{config.source.groupId || 'All projects'}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="config-card">
+                  <h3>Target GitLab</h3>
+                  <div className="config-details">
+                    <div className="config-item">
+                      <span className="config-label">URL</span>
+                      <span className="config-value">{config.target.url}</span>
+                    </div>
+                    <div className="config-item">
+                      <span className="config-label">Group ID</span>
+                      <span className="config-value">
+                        {config.target.groupId ? config.target.groupId : 'Preserve source structure'}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="config-card">
+                  <h3>Sync Schedule</h3>
+                  <div className="config-details">
+                    <div className="config-item">
+                      <span className="config-label">Schedule</span>
+                      <span className="config-value">{config.syncSchedule}</span>
+                    </div>
+                    <div className="config-item">
+                      <span className="config-label">Description</span>
+                      <span className="config-value">Daily at 2:00 AM</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Notifications */}
       {notification && (
