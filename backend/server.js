@@ -30,7 +30,7 @@ const CONFIG = {
   },
   
   // Webhook Security
-  webhookSecret: process.env.WEBHOOK_SECRET || crypto.randomBytes(32).toString('hex'),
+  webhookSecret: process.env.WEBHOOK_SECRET || process.env.gitlab_webhook_secret || crypto.randomBytes(32).toString('hex'),
   
   // JWT Configuration
   jwtSecret: process.env.JWT_SECRET || crypto.randomBytes(64).toString('hex'),
