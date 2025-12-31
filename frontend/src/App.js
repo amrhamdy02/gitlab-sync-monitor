@@ -320,7 +320,7 @@ function App() {
         </button>
         
         <span className="pagination-info">
-          {totalItems} total
+          {Array.isArray(totalItems) ? totalItems.length : totalItems} total
         </span>
       </div>
     );
