@@ -527,12 +527,12 @@ function App() {
                     
                     return pageData.map((commit, index) => (
                       <tr key={index} className={commit.is_force ? 'force-push' : ''}>
-                        <td><strong>{commit.repository}</strong></td>
-                        <td><span className="branch-tag">{commit.branch}</span></td>
+                        <td><strong>{String(commit.repository || 'Unknown')}</strong></td>
+                        <td><span className="branch-tag">{String(commit.branch || 'unknown')}</span></td>
                         <td>
                           <div className="author-info">
-                            <span className="author-name">{commit.author_name}</span>
-                            <span className="author-email">{commit.author_email}</span>
+                            <span className="author-name">{String(commit.author_name || 'Unknown')}</span>
+                            <span className="author-email">{String(commit.author_email || '')}</span>
                           </div>
                         </td>
                         <td>
@@ -542,13 +542,23 @@ function App() {
                             rel="noopener noreferrer"
                             className="commit-link"
                           >
-                            <code className="commit-sha">{commit.sha?.substring(0, 8) || 'N/A'}</code>
+                            <code className="commit-sha">
+                              {commit.sha ? String(commit.sha).substring(0, 8) : 'N/A'}
+                            </code>
                           </a>
                         </td>
-                        <td><div className="commit-message">{commit.message}</div></td>
                         <td>
-                          <span className={`commit-type-badge ${commit.type}`}>
-                            {commit.is_force ? 'Force' : commit.type}
+                          <div className="commit-message">
+                            {typeof commit.message === 'string' 
+                              ? commit.message 
+                              : typeof commit.message === 'object'
+                              ? JSON.stringify(commit.message)
+                              : String(commit.message || '')}
+                          </div>
+                        </td>
+                        <td>
+                          <span className={`commit-type-badge ${commit.type || 'push'}`}>
+                            {commit.is_force ? 'Force' : String(commit.type || 'push')}
                           </span>
                         </td>
                         <td>{formatTimeAgo(commit.timestamp)}</td>
