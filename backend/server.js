@@ -541,14 +541,16 @@ async function syncRepository(repoId) {
     }
     
     // Push branches and tags (NOT --mirror to avoid hidden refs)
+    // Using --force to ensure source always wins (mirror behavior)
     try {
-      await repoGit.push(targetUrl.toString(), '--all');
-      console.log(`  ✅ Branches pushed`);
+      await repoGit.push(targetUrl.toString(), '--all', '--force');
+      console.log(`  ✅ Branches pushed (forced)`);
       
-      await repoGit.push(targetUrl.toString(), '--tags');
-      console.log(`  ✅ Tags pushed`);
+      await repoGit.push(targetUrl.toString(), '--tags', '--force');
+      console.log(`  ✅ Tags pushed (forced)`);
     } catch (pushError) {
-      console.warn(`  ⚠️ Push warning: ${pushError.message}`);
+      // If push fails even with force, this is a real error
+      throw new Error(`Failed to push: ${pushError.message}`);
     }
     
     console.log(`  ✅ Mirror push completed`);
