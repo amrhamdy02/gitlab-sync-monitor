@@ -543,10 +543,11 @@ async function syncRepository(repoId) {
     // Push branches and tags (NOT --mirror to avoid hidden refs)
     // Using --force to ensure source always wins (mirror behavior)
     try {
-      await repoGit.push(targetUrl.toString(), '--all', '--force');
+      // Use raw git commands for proper --force support
+      await repoGit.raw(['push', '--all', '--force', targetUrl.toString()]);
       console.log(`  ✅ Branches pushed (forced)`);
       
-      await repoGit.push(targetUrl.toString(), '--tags', '--force');
+      await repoGit.raw(['push', '--tags', '--force', targetUrl.toString()]);
       console.log(`  ✅ Tags pushed (forced)`);
     } catch (pushError) {
       // If push fails even with force, this is a real error
